@@ -1,0 +1,146 @@
+name: Release artifacts
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build (for example v0.1.0-alpha.2)
+        required: true
+        type: string
+
+# Publishing is a separate maintainer action after every artifact check passes.
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTUP_TOOLCHAIN: stable
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      RELEASE_TARGET: ${{ matrix.target }}
+    steps:
+      - name: Validate requested version tag
+        id: tag
+        shell: bash
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Check out exact tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+          persist-credentials: false
+
+      - name: Install stable Rust components
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy --component rust-docs
+
+      - name: Verify tag, package version and native target
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--locked', '--no-deps', '--format-version', '1'], text=True))
+          version = metadata['packages'][0]['version']
+          assert os.environ['RELEASE_TAG'] == 'v' + version
+          host = next(line.removeprefix('host: ') for line in subprocess.check_output(['rustc', '-vV'], text=True).splitlines() if line.startswith('host: '))
+          assert host == os.environ['RELEASE_TARGET'], (host, os.environ['RELEASE_TARGET'])
+          PY
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+
+      - name: Check formatting, lints and tests
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          python3 -m unittest discover -s tests -p 'test_*.py'
+
+      - name: Build and smoke-test release binary
+        shell: bash
+        run: |
+          cargo build --locked --release
+          python3 scripts/release-smoke.py target/release/rusta-pitest \
+            --expected-version "${RELEASE_TAG#v}" \
+            --expected-revision "$(git rev-parse HEAD)" \
+            --expected-target "$RELEASE_TARGET" --require-clean
+
+      - name: Audit locked dependencies
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit --deny warnings
+
+      - name: Generate and verify third-party notices
+        shell: bash
+        run: |
+          python3 scripts/generate-notices.py --target "$RELEASE_TARGET" --output-dir target/notices
+          python3 scripts/generate-notices.py --target "$RELEASE_TARGET" --output-dir target/notices --check --offline
+
+      - name: Package binary, license and provenance
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, shutil, subprocess, tarfile
+          from pathlib import Path
+          name = f"rusta-pitest-{os.environ['RELEASE_TAG']}-{os.environ['RELEASE_TARGET']}"
+          output = Path('target/release-assets')
+          package = output / name
+          package.mkdir(parents=True)
+          notice_files = ['THIRD-PARTY-NOTICES.txt', 'THIRD-PARTY-MANIFEST.json', 'RUST-STDLIB-LICENSE.html']
+          for source in ['target/release/rusta-pitest', 'README.md', 'LICENSE', *(str(Path('target/notices') / filename) for filename in notice_files)]:
+              shutil.copy2(source, package)
+          provenance = {
+              'version': os.environ['RELEASE_TAG'].removeprefix('v'),
+              'tag': os.environ['RELEASE_TAG'],
+              'git_revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+              'target': os.environ['RELEASE_TARGET'],
+              'rustc': subprocess.check_output(['rustc', '--version'], text=True).strip(),
+              'workflow_run': os.environ['GITHUB_RUN_ID'],
+              'workflow_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'third_party_manifest_sha256': hashlib.sha256((package / 'THIRD-PARTY-MANIFEST.json').read_bytes()).hexdigest(),
+          }
+          (package / 'build-info.json').write_text(json.dumps(provenance, indent=2) + '\n')
+          def digest(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+          (package / 'SHA256SUMS').write_text(''.join(f'{digest(p)}  {p.name}\n' for p in sorted(package.iterdir())))
+          archive = output / f'{name}.tar.gz'
+          with tarfile.open(archive, 'w:gz') as tar:
+              tar.add(package, arcname=name)
+          (output / f'{archive.name}.sha256').write_text(f'{digest(archive)}  {archive.name}\n')
+          # Test the distributable contents rather than only the build directory.
+          unpacked = output / 'unpacked'
+          unpacked.mkdir()
+          expected_members = {name, *(f'{name}/{p.name}' for p in package.iterdir())}
+          with tarfile.open(archive) as tar:
+              assert {member.name for member in tar.getmembers()} == expected_members
+              assert all(member.isfile() or member.isdir() for member in tar.getmembers())
+          subprocess.run(['tar', '-xzf', str(archive), '-C', str(unpacked)], check=True)
+          for line in (unpacked / name / 'SHA256SUMS').read_text().splitlines():
+              expected, filename = line.split('  ', 1)
+              assert digest(unpacked / name / filename) == expected
+          subprocess.run(['python3', 'scripts/release-smoke.py', str(unpacked / name / 'rusta-pitest'), '--expected-version', provenance['version'], '--expected-revision', provenance['git_revision'], '--expected-target', provenance['target'], '--require-clean'], check=True)
+          PY
+
+      - name: Upload verified release artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rusta-pitest-${{ env.RELEASE_TAG }}-${{ matrix.target }}
+          path: |
+            target/release-assets/*.tar.gz
+            target/release-assets/*.sha256
+          if-no-files-found: error
+          retention-days: 30

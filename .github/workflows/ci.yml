@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Rust and report checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust components
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy --component rust-docs
+
+      - name: Check Rust formatting
+        run: cargo fmt --check
+
+      - name: Check Rust lints
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run Rust tests
+        run: cargo test --locked
+
+      - name: Run report regression tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
+
+      - name: Audit locked dependencies
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit --deny warnings
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: Generate and verify third-party notices
+        run: |
+          python3 scripts/generate-notices.py --output-dir target/notices
+          python3 scripts/generate-notices.py --output-dir target/notices --check --offline
+
+      - name: Smoke-test release binary
+        run: python3 scripts/release-smoke.py target/release/rusta-pitest --expected-revision "$GITHUB_SHA" --require-clean

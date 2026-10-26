@@ -1,0 +1,39 @@
+[package]
+name = "rusta-pitest"
+version = "0.1.0-alpha.2"
+edition = "2024"
+description = "A small CLI for testing and benchmarking HTTP APIs"
+license = "Apache-2.0"
+repository = "https://github.com/givtaj/rusta-pitest"
+readme = "README.md"
+keywords = ["http", "api", "benchmark", "testing", "cli"]
+categories = ["command-line-utilities", "development-tools::testing"]
+# Include the runner, reusable checks, and standalone documentation.
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/build.rs",
+    "/src/**",
+    "/tests/*.rs",
+    "/tests/test_build_provenance.py",
+    "/tests/test_notices.py",
+    "/scripts/release-smoke.py",
+    "/scripts/generate-notices.py",
+    "/LICENSE",
+    "/SECURITY.md",
+    "/CONTRIBUTING.md",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/docs/json-reports.md",
+    "/docs/roots-catalogue.md",
+    "/docs/sleepapi-profile.md",
+    "/docs/release-policy.md",
+    "/docs/releases/v0.1.0-alpha.2.md",
+]
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+hdrhistogram = { version = "7.5", default-features = false }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
