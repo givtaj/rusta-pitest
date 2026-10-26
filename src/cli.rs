@@ -6,7 +6,7 @@ use crate::catalogue::{ROOTS_BASE_URL, Target, parse_base_url, parse_target};
 #[derive(Parser)]
 #[command(
     version,
-    about = "Send GET or POST requests and measure response times"
+    about = "Test HTTP APIs, generate OpenAPI suites, and measure response times"
 )]
 pub struct Cli {
     /// Save a versioned JSON report to a new file (keeps terminal output)
@@ -18,6 +18,16 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Generate a reviewable suite from a raw OpenAPI contract
+    Openapi {
+        #[command(subcommand)]
+        command: OpenApiCommand,
+    },
+    /// Preview or explicitly execute a generated contract suite
+    Suite {
+        #[command(subcommand)]
+        command: SuiteCommand,
+    },
     /// Open the guided request wizard (also used when no command is given)
     Wizard,
     /// List available targets without sending requests
@@ -45,6 +55,60 @@ pub enum Command {
         #[arg(long, value_parser = parse_json)]
         json: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub enum OpenApiCommand {
+    /// Read OpenAPI 3.1 JSON/YAML from a local path or HTTP(S) URL
+    Generate {
+        source: String,
+        /// Write a new suite file; existing files are never overwritten
+        #[arg(long, value_name = "FILE")]
+        out: std::path::PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SuiteCommand {
+    /// Preview by default; --execute sends selected GET/HEAD requests
+    Run(SuiteOptions),
+}
+
+#[derive(Args)]
+pub struct SuiteOptions {
+    pub suite: std::path::PathBuf,
+    /// Explicit API base URL, including an optional path prefix
+    #[arg(long, value_parser = parse_url)]
+    pub base_url: Option<Url>,
+    /// Send requests after all selected cases pass preflight
+    #[arg(long)]
+    pub execute: bool,
+    /// Select an operation ID; repeat for multiple operations
+    #[arg(long = "operation")]
+    pub operations: Vec<String>,
+    /// Bind a fixture slot: NAME=VALUE; values are not saved in reports
+    #[arg(long = "fixture", value_parser = parse_assignment)]
+    pub fixtures: Vec<(String, String)>,
+    /// Bind a security scheme to an environment variable: SCHEME=ENV_NAME
+    #[arg(long = "auth-env", value_parser = parse_assignment)]
+    pub auth_env: Vec<(String, String)>,
+    /// Timeout through the full response body
+    #[arg(long, default_value_t = 5000, value_parser = clap::value_parser!(u32).range(1..))]
+    pub timeout_ms: u32,
+    /// Maximum request starts per second; requests execute sequentially
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=100))]
+    pub rate_per_second: u16,
+    /// Refuse selections above this request budget
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    pub max_requests: u32,
+}
+
+fn parse_assignment(input: &str) -> Result<(String, String), String> {
+    let (name, value) = input.split_once('=').ok_or("expected NAME=VALUE")?;
+    if name.is_empty() || value.is_empty() {
+        return Err("expected a non-empty NAME and VALUE".into());
+    }
+    Ok((name.to_owned(), value.to_owned()))
 }
 
 #[derive(Args)]

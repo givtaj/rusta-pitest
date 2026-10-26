@@ -28,7 +28,15 @@ preserves existing files. Tests must establish that attempted requests equal the
 sum of success, unexpected status, timeout, and transport/body failure counts.
 Every attempt contributes a latency sample. Smoke tests exercise the distributed
 executable's version, GET/POST, failure exit codes, and saved report behavior;
-the broader regression suite covers the remaining cases.
+the broader regression suite covers the remaining cases. From alpha.3 onward,
+both built and extracted release binaries must also pass OpenAPI generation,
+traffic-free preview, explicitly bound authenticated GET, response-validation
+failure, write refusal, and existing-output protection smoke checks.
+
+OpenAPI acceptance also covers API keys, security alternatives and combined
+requirements, authentication/header conflicts, request budgets, rate pacing,
+full-response timeouts, and response-size limits against disposable loopback
+fixtures. These checks do not authorize traffic to external services.
 
 The initial public alpha has 46 Rust tests. The Python suite includes four
 offline build-provenance regressions and notice-generation tests. The final
@@ -75,9 +83,12 @@ other external service.
   musl/Alpine, and other Linux architectures are unverified.
 - macOS arm64 built and tested on the selected GitHub runner. Intel macOS and
   Windows are unverified. The macOS executable is unsigned and not notarized.
-- Direct HTTP/HTTPS over HTTP/1.1, with closed-loop concurrency and connection
-  reuse. No custom headers, session cookies, proxy support, automatic retries,
-  redirects, warmup phase, or distributed load generation.
+- Direct benchmarks use HTTP/HTTPS over HTTP/1.1 with closed-loop concurrency
+  and connection reuse. Custom headers and session cookies are not supported by
+  those commands. OpenAPI suites support documented scalar headers, bearer and
+  header API-key authentication, with explicitly selected GET/HEAD execution.
+  Neither mode enables proxies, automatic retries, redirects, warmup, or
+  distributed load generation.
 - JSON schema version 1 is documented but remains an alpha interface. Future
   incompatible changes must be called out and use an appropriate schema version.
 

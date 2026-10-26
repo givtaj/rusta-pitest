@@ -1,4 +1,9 @@
-# JSON reports, schema version 1
+# JSON benchmark reports, schema version 1
+
+Check both `schema_version` and `kind` when consuming reports. This document
+describes `kind: request` and `kind: profile`. OpenAPI suite reports use
+`kind: suite` and a separate preview/execution shape described in
+[OpenAPI suites](openapi-suites.md#reports-and-editable-suites).
 
 Use `--output FILE` before or after a command to save one JSON document while
 keeping the normal terminal output. It works with `get`, `post`, `target`,
