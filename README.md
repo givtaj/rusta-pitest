@@ -7,18 +7,18 @@ neither service is required to use the runner.
 
 ## Install the alpha
 
-`v0.1.0-alpha.2` is the first public alpha release. CLI options and the JSON report
-schema may change in later alpha versions. The supported release binaries are
+`v0.1.0-alpha.3` adds experimental OpenAPI contract suites. CLI options and the
+JSON report schema may change in later alpha versions. The supported binaries are
 Linux x86_64 (Ubuntu 24.04 or a compatible glibc environment) and macOS arm64.
 Other operating systems and architectures are not verified for this release.
 
 Download the archive for your platform and `SHA256SUMS` from the
-[GitHub release](https://github.com/givtaj/rusta-pitest/releases/tag/v0.1.0-alpha.2).
+[GitHub release](https://github.com/givtaj/rusta-pitest/releases/tag/v0.1.0-alpha.3).
 Verify the downloaded archive before extracting it:
 
 ```sh
 # macOS; on Linux, use sha256sum instead of shasum -a 256.
-shasum -a 256 rusta-pitest-v0.1.0-alpha.2-*.tar.gz
+shasum -a 256 rusta-pitest-v0.1.0-alpha.3-*.tar.gz
 ```
 
 Compare the complete digest and filename with the matching line in
@@ -32,7 +32,7 @@ toolchain:
 
 ```sh
 cargo install --locked --git https://github.com/givtaj/rusta-pitest.git \
-  --tag v0.1.0-alpha.2 rusta-pitest
+  --tag v0.1.0-alpha.3 rusta-pitest
 rusta-pitest --version
 ```
 
@@ -40,7 +40,7 @@ This alpha is distributed through GitHub; no crates.io publication is required.
 The repository development examples below use `cargo run --release -- ...`;
 after installation, use `rusta-pitest ...` with the same arguments.
 
-See the [release notes](docs/releases/v0.1.0-alpha.2.md),
+See the [release notes](docs/releases/v0.1.0-alpha.3.md),
 [release thresholds](docs/release-policy.md), and [changelog](CHANGELOG.md).
 The thresholds govern release quality; the CLI does not currently provide
 configurable latency or throughput pass/fail limits.
@@ -71,6 +71,23 @@ output filename on repeat runs because existing reports are never overwritten.
 Press Ctrl-C in the server terminal when finished. This server is a convenient
 functional fixture, not a performance baseline. The examples require Python 3;
 the runner itself does not.
+
+## OpenAPI contract suites
+
+Generate a reviewable suite from a raw OpenAPI 3.1 JSON/YAML URL or local path,
+then preview it without API traffic:
+
+```sh
+rusta-pitest openapi generate ./openapi.yaml --out /tmp/api.suite.json
+rusta-pitest suite run /tmp/api.suite.json
+```
+
+Execution requires `--execute`, an explicit `--base-url`, and selected
+`--operation` IDs. The initial runner permits GET/HEAD only, with fixture IDs
+and bearer/header API-key credentials bound at runtime. Writes and unsupported
+semantics remain visibly blocked. See [OpenAPI suites](docs/openapi-suites.md)
+for a [synthetic example](examples/widgets.openapi.yaml), execution, supported
+contracts, and coverage reports.
 
 ## Guided mode
 
@@ -207,8 +224,9 @@ cargo run --release -- post http://127.0.0.1:3000/echo \
 ```
 
 The echo URL is an example requiring a server that accepts POST; Python's simple
-HTTP server does not provide it. This CLI does not yet support custom headers or
-session cookies. POST behavior is verified by a local server in the integration
+HTTP server does not provide it. Direct benchmark commands do not support custom
+headers or session cookies. OpenAPI suites provide contract-defined scalar headers
+and bearer/header API-key authentication. POST behavior is verified by a local server in the integration
 tests. Omitting `--json` sends an empty POST;
 providing it validates the JSON before sending and sets
 `Content-Type: application/json`. Each repetition sends the same body again.

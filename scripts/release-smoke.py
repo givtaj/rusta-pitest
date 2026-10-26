@@ -4,6 +4,7 @@
 import argparse
 import json
 import math
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import re
@@ -30,7 +31,35 @@ def main():
         r'^version\s*=\s*"([^"\n]+)"\s*$', package, re.MULTILINE
     ).group(1)
     requests = []
+    api_headers = []
     lock = threading.Lock()
+    api_token = "rusta-smoke-auth-secret"
+    fixture_id = "rusta-smoke-fixture-secret"
+    widget_response = {"200": {
+        "description": "Synthetic widget",
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Widget"}}},
+    }}
+    widget_parameter = [{"name": "id", "in": "path", "required": True,
+                         "schema": {"type": "string"}}]
+    openapi_contract = {
+        "openapi": "3.1.0", "info": {"title": "Release smoke fixture", "version": "1"},
+        "security": [{"bearer": []}],
+        "paths": {
+            "/widgets/{id}": {"get": {"operationId": "getWidget",
+                "parameters": widget_parameter, "responses": widget_response}},
+            "/broken/{id}": {"get": {"operationId": "getBroken",
+                "parameters": widget_parameter, "responses": widget_response}},
+            "/empty": {"head": {"operationId": "headEmpty",
+                "responses": {"204": {"description": "No body"}}}},
+            "/widgets": {"post": {"operationId": "createWidget",
+                "responses": {"201": {"description": "Created"}}}},
+        },
+        "components": {
+            "securitySchemes": {"bearer": {"type": "http", "scheme": "bearer"}},
+            "schemas": {"Widget": {"type": "object", "required": ["id", "name"],
+                "properties": {"id": {"type": "string"}, "name": {"type": "string"}}}},
+        },
+    }
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -44,6 +73,9 @@ def main():
         def do_POST(self):
             self.respond()
 
+        def do_HEAD(self):
+            self.respond()
+
         def respond(self):
             body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             with lock:
@@ -53,12 +85,31 @@ def main():
             elif self.path == "/duration":
                 time.sleep(0.01)
             payload = b'{"ok":true}'
+            status = 503 if self.path == "/failure" else 200
+            if self.path == "/openapi.json":
+                payload = json.dumps(openapi_contract).encode()
+            elif self.path.startswith("/api/v1/"):
+                authorization = self.headers.get("Authorization")
+                with lock:
+                    api_headers.append((self.path, authorization))
+                if authorization != f"Bearer {api_token}":
+                    status, payload = 401, b'{"error":"synthetic unauthorized"}'
+                elif self.path == "/api/v1/empty" and self.command == "HEAD":
+                    status, payload = 204, b""
+                elif self.path == f"/api/v1/widgets/{fixture_id}" and self.command == "GET":
+                    payload = json.dumps({"id": fixture_id, "name": "Synthetic widget"}).encode()
+                elif self.path == f"/api/v1/broken/{fixture_id}" and self.command == "GET":
+                    payload = json.dumps({"id": fixture_id, "name": 7,
+                                          "private": "rusta-smoke-response-secret"}).encode()
+                else:
+                    status, payload = 404, b'{"error":"unexpected synthetic route"}'
             try:
-                self.send_response(503 if self.path == "/failure" else 200)
+                self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
-                self.wfile.write(payload)
+                if self.command != "HEAD":
+                    self.wfile.write(payload)
             except (BrokenPipeError, ConnectionResetError):
                 pass  # Expected after the client's timeout smoke case.
 
@@ -71,22 +122,20 @@ def main():
         with tempfile.TemporaryDirectory(prefix="rusta-release-smoke-") as directory:
             directory = Path(directory)
 
-            def run(arguments, expected=0, stdin=""):
+            def run(arguments, expected=0, stdin="", environment=None):
+                env = os.environ.copy()
+                if environment:
+                    env.update(environment)
                 result = subprocess.run(
                     [str(binary), *arguments], cwd=directory, input=stdin,
-                    capture_output=True, text=True, timeout=15,
+                    capture_output=True, text=True, timeout=15, env=env,
                 )
                 assert result.returncode == expected, (
                     arguments, result.returncode, result.stdout, result.stderr
                 )
                 return result
 
-            def report(name, arguments, expected=0, count=None):
-                run([*arguments, "--output", f"{name}.json"], expected)
-                document = json.loads((directory / f"{name}.json").read_text())
-                assert document["schema_version"] == 1
-                assert document["passed"] == (expected == 0)
-                identity = document["runner"]
+            def check_identity(identity):
                 assert identity["version"] == version
                 assert identity["build_profile"] == "release"
                 if args.expected_revision:
@@ -95,6 +144,13 @@ def main():
                     assert identity["target"] == args.expected_target
                 if args.require_clean:
                     assert identity["source_dirty"] is False
+
+            def report(name, arguments, expected=0, count=None):
+                run([*arguments, "--output", f"{name}.json"], expected)
+                document = json.loads((directory / f"{name}.json").read_text())
+                assert document["schema_version"] == 1
+                assert document["passed"] == (expected == 0)
+                check_identity(document["runner"])
                 metrics = document["runs"][0]["report"]["metrics"]
                 attempted = metrics["attempted"]
                 assert attempted > 0
@@ -140,11 +196,140 @@ def main():
             run(["get", f"{origin}/ok", "--output", "get.json"], expected=1)
             assert len(requests) == before, "existing output must fail before traffic"
             assert (directory / "get.json").read_bytes() == original
+
+            # Exercise the feature using this exact executable, including when
+            # the caller is testing the extracted release archive's binary.
+            (directory / "contract.json").write_text(json.dumps(openapi_contract))
+            (directory / "contract.yaml").write_text("""openapi: 3.1.0
+info: {title: Release smoke fixture, version: "1"}
+security: [{bearer: []}]
+paths:
+  /widgets/{id}:
+    get:
+      operationId: getWidget
+      parameters: [{name: id, in: path, required: true, schema: {type: string}}]
+      responses:
+        "200":
+          description: Synthetic widget
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Widget"}
+  /broken/{id}:
+    get:
+      operationId: getBroken
+      parameters: [{name: id, in: path, required: true, schema: {type: string}}]
+      responses:
+        "200":
+          description: Synthetic widget
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Widget"}
+  /empty:
+    head:
+      operationId: headEmpty
+      responses: {"204": {description: No body}}
+  /widgets:
+    post:
+      operationId: createWidget
+      responses: {"201": {description: Created}}
+components:
+  securitySchemes:
+    bearer: {type: http, scheme: bearer}
+  schemas:
+    Widget:
+      type: object
+      required: [id, name]
+      properties:
+        id: {type: string}
+        name: {type: string}
+""")
+            before = len(requests)
+            run(["openapi", "generate", "contract.json", "--out", "suite.json"])
+            run(["openapi", "generate", "contract.yaml", "--out", "yaml-suite.json"])
+            assert len(requests) == before, "local generation must not call API operations"
+            suite = json.loads((directory / "suite.json").read_text())
+            yaml_suite = json.loads((directory / "yaml-suite.json").read_text())
+            assert suite["suite_version"] == 1
+            assert suite["contract"] == yaml_suite["contract"]
+            assert suite["cases"] == yaml_suite["cases"]
+            assert len(suite["cases"]) == 4
+            write_case = next(case for case in suite["cases"] if case["id"] == "createWidget")
+            assert write_case["blockers"], "writes must remain visible and blocked"
+            original_suite = (directory / "suite.json").read_bytes()
+            run(["openapi", "generate", "contract.json", "--out", "suite.json"], expected=1)
+            assert (directory / "suite.json").read_bytes() == original_suite
+            assert len(requests) == before
+
+            run(["openapi", "generate", f"{origin}/openapi.json", "--out", "url-suite.json"])
+            assert len(requests) == before + 1
+            assert requests[-1][:2] == ("GET", "/openapi.json")
+            assert json.loads((directory / "url-suite.json").read_text())["cases"] == suite["cases"]
+
+            def suite_report(name, arguments, expected=0, environment=None):
+                result = run(["suite", "run", "suite.json", *arguments,
+                              "--output", f"{name}.json"], expected, environment=environment)
+                document = json.loads((directory / f"{name}.json").read_text())
+                assert document["schema_version"] == 1 and document["kind"] == "suite"
+                check_identity(document["runner"])
+                for key in ("source_digest", "contract_digest", "suite_digest"):
+                    assert re.fullmatch(r"[0-9a-f]{64}", document[key])
+                for secret in (api_token, fixture_id, "rusta-smoke-response-secret"):
+                    assert secret not in json.dumps(document), "suite report disclosed runtime data"
+                    assert secret not in result.stdout and secret not in result.stderr
+                return document
+
+            before = len(requests)
+            preview = suite_report("suite-unbound", [])
+            assert preview["mode"] == "preview" and preview["passed"] is None
+            assert preview["executed"] is False and preview["counts"]["blocked"] == 4
+            target = ["--base-url", f"{origin}/api/v1", "--auth-env", "bearer=RUSTA_SMOKE_API_TOKEN"]
+            get_arguments = [*target, "--operation", "getWidget",
+                             "--fixture", f"getWidget.path.id={fixture_id}"]
+            preview = suite_report("suite-ready", get_arguments)
+            assert preview["passed"] is None and preview["ready"] is True
+            assert preview["counts"]["ready"] == 1
+            assert len(requests) == before, "suite previews must send no traffic"
+            run(["suite", "run", "suite.json", *target, "--operation", "createWidget",
+                 "--execute"], expected=1,
+                environment={"RUSTA_SMOKE_API_TOKEN": api_token})
+            assert len(requests) == before, "blocked write execution must send no traffic"
+
+            environment = {"RUSTA_SMOKE_API_TOKEN": api_token}
+            success = suite_report("suite-get", [*get_arguments, "--execute"], environment=environment)
+            assert success["passed"] is True and success["counts"]["passed"] == 1
+            assert success["counts"]["skipped"] == 3 and success["counts"]["total"] == 4
+            row = next(case for case in success["cases"] if case["id"] == "getWidget")
+            assert row["checks"]["body_schema"] == "passed"
+            assert len(requests) == before + 1
+            assert requests[-1][:2] == ("GET", f"/api/v1/widgets/{fixture_id}")
+            assert api_headers[-1] == (f"/api/v1/widgets/{fixture_id}", f"Bearer {api_token}")
+
+            head = suite_report("suite-head", [*target, "--operation", "headEmpty", "--execute"],
+                                environment=environment)
+            assert head["passed"] is True and head["counts"]["passed"] == 1
+            row = next(case for case in head["cases"] if case["id"] == "headEmpty")
+            assert row["checks"]["body_schema"] == "not_applicable"
+            failure = suite_report("suite-schema-failure", [*target, "--operation", "getBroken",
+                "--fixture", f"getBroken.path.id={fixture_id}", "--execute"],
+                expected=1, environment=environment)
+            assert failure["passed"] is False and failure["counts"]["failed"] == 1
+            row = next(case for case in failure["cases"] if case["id"] == "getBroken")
+            assert row["checks"]["body_schema"] == "failed"
+            assert "response_schema_mismatch" in row["reasons"]
+
+            original = (directory / "suite-get.json").read_bytes()
+            before = len(requests)
+            run(["suite", "run", "suite.json", *get_arguments, "--execute",
+                 "--output", "suite-get.json"], expected=1, environment=environment)
+            assert len(requests) == before, "existing suite report must fail before traffic"
+            assert (directory / "suite-get.json").read_bytes() == original
+            assert not any(method == "POST" and path.startswith("/api/")
+                           for method, path, _ in requests)
     finally:
         server.shutdown()
         server.server_close()
         worker.join(timeout=2)
-    print(f"Release smoke passed: {version}; GET, POST, duration, statuses, timeout, JSON accounting, redaction and output preservation")
+    print(f"Release smoke passed: {version}; GET, POST, duration, statuses, timeout, JSON accounting, OpenAPI JSON/YAML/URL generation, previews, authenticated GET/HEAD, schema failure, redaction and output preservation")
 
 
 if __name__ == "__main__":

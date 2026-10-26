@@ -140,15 +140,27 @@ impl ReportFile {
     }
 
     pub fn finish(mut self, document: &Document) -> io::Result<()> {
+        self.write_value(&document.to_json())?;
+        eprintln!("JSON report: {}", self.destination.display());
+        Ok(())
+    }
+
+    /// Publish a separate, versioned artifact without changing benchmark v1.
+    pub fn finish_value(mut self, value: &Value) -> io::Result<()> {
+        self.write_value(value)?;
+        eprintln!("JSON output: {}", self.destination.display());
+        Ok(())
+    }
+
+    fn write_value(&mut self, value: &Value) -> io::Result<()> {
         let mut file = self.file.take().expect("prepared report file");
-        serde_json::to_writer_pretty(&mut file, &document.to_json())?;
+        serde_json::to_writer_pretty(&mut file, value)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
         drop(file);
         // hard_link atomically fails if the destination now exists. Rename
         // would overwrite it on Unix. Both names are on the same filesystem.
         fs::hard_link(&self.temporary, &self.destination)?;
-        eprintln!("JSON report: {}", self.destination.display());
         Ok(())
     }
 }

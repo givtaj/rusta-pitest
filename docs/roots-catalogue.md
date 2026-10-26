@@ -63,7 +63,9 @@ the runner does not independently inspect a database or process.
 Routes and status contracts can differ between service versions. The catalogue
 is not proof that a server is running, that its deployment is current, or that
 its access controls are complete. Use custom GET/POST for other endpoints.
-Authentication, custom headers, cookies, and PATCH are not implemented.
+Catalogue commands do not implement authentication, custom headers, cookies,
+or PATCH. Separate [OpenAPI suites](openapi-suites.md) support bearer/header
+API-key bindings for explicitly selected contract GET/HEAD operations.
 
 The runner's integration tests use local fixtures to verify catalogue selection,
 URL construction, status defaults, overrides, and wizard behavior. They do not

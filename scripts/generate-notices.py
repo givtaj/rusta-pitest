@@ -38,6 +38,30 @@ AWS_COMPONENTS = (
     "MIT License", "BSD 3-Clause", "MIT No Attribution",
 )
 
+# Reviewed omissions in these exact locked releases only. The helper crates'
+# original manifests inherit the workspace license, and all three archives pin
+# the same repository commit. Other versions or missing-license crates still fail.
+JSONSCHEMA_LICENSE_COMMIT = "4eb7a64d9cf45bcbf38c7a69e544477294460751"
+JSONSCHEMA_REPOSITORY = "https://github.com/Stranger6667/jsonschema"
+JSONSCHEMA_LICENSE_SHA256 = "117829c3ca21efb132d81a44b55363d395ab8eea18526873bc828da4c0e5f038"
+WORKSPACE_LICENSE_PACKAGES = {
+    ("jsonschema-regex", "0.60.1"): "crates/jsonschema-regex",
+    ("jsonschema-value", "0.60.1"): "crates/jsonschema-value",
+}
+
+# These crate archives omit the repository's supplied license. This verbatim
+# supplement was fetched from the commit recorded inside both locked archives;
+# it is not synthesized from SPDX metadata or borrowed from a different project.
+SIMD_LICENSE_COMMIT = "d74c030d9dc4f3cae02146d1f497ff62726ef09a"
+SIMD_REPOSITORY = "https://github.com/Nugine/simd"
+SIMD_LICENSE_FILE = "licenses/Nugine-simd-d74c030d-LICENSE"
+SIMD_LICENSE_SHA256 = "71674605ec4c087fe9eb534e3e4f9e26eb2e4aabcd76a29fd156c6a844d44b3d"
+UPSTREAM_LICENSE_PACKAGES = {
+    ("uuid-simd", "0.8.0"): "crates/uuid-simd",
+    ("vsimd", "0.8.0"): "crates/vsimd",
+}
+SUPPLEMENT_ROOT = Path(__file__).resolve().parents[1]
+
 
 def sha256(data):
     return hashlib.sha256(data).hexdigest()
@@ -139,7 +163,95 @@ def source_header(data, suffix):
     return header + "\n"
 
 
-def collect_package(package, checksums):
+def original_package_fields(files):
+    """Read only reviewed scalar identity fields, without a general TOML parser."""
+    original = files.get("Cargo.toml.orig", b"").decode("utf-8")
+    blocks = re.findall(r"(?ms)^\[package\][ \t]*\r?\n(.*?)(?=^\[|\Z)", original)
+    if len(blocks) != 1:
+        raise ValueError("license fallback requires one original package manifest")
+    result = {}
+    for key in ("name", "version", "repository", "license", "repository.workspace", "license.workspace"):
+        values = re.findall(r"(?m)^" + re.escape(key) + r"\s*=\s*(.+)$", blocks[0])
+        if len(values) > 1:
+            raise ValueError("duplicate license fallback identity field")
+        if values:
+            result[key] = values[0].strip()
+    return result
+
+
+def checked_license_identity(package, files, repository, commit, path_in_vcs, inherited):
+    if package.get("repository") != repository or package.get("license") != "MIT":
+        raise ValueError("license fallback repository or license identity changed")
+    fields = original_package_fields(files)
+    if fields.get("name") != json.dumps(package["name"]) or fields.get("version") != json.dumps(package["version"]):
+        raise ValueError("license fallback original package identity changed")
+    if inherited:
+        if fields.get("license.workspace") != "true" or fields.get("repository.workspace") != "true":
+            raise ValueError("license fallback requires explicit workspace inheritance")
+    elif fields.get("license") != '"MIT"' or fields.get("repository") != json.dumps(repository):
+        raise ValueError("license fallback original repository or license changed")
+    try:
+        vcs = json.loads(files[".cargo_vcs_info.json"])
+    except (KeyError, ValueError, UnicodeDecodeError) as error:
+        raise ValueError("license fallback requires archived VCS identity") from error
+    if (vcs.get("git", {}).get("sha1") != commit
+            or vcs.get("git", {}).get("dirty", False) is not False
+            or vcs.get("path_in_vcs") != path_in_vcs):
+        raise ValueError("license fallback archived VCS identity changed")
+
+
+def fallback_license(package, files, checksums, inventory):
+    identity = (package["name"], package["version"])
+    if identity in WORKSPACE_LICENSE_PACKAGES:
+        checked_license_identity(package, files, JSONSCHEMA_REPOSITORY,
+                                 JSONSCHEMA_LICENSE_COMMIT, WORKSPACE_LICENSE_PACKAGES[identity], True)
+        providers = [candidate for candidate in inventory
+                     if candidate["name"] == "jsonschema" and candidate["version"] == "0.60.1"
+                     and candidate.get("source") == package.get("source")]
+        if len(providers) != 1:
+            raise ValueError("license fallback requires the locked jsonschema 0.60.1 provider")
+        provider = providers[0]
+        provider_files, provider_checksum = registry_files(provider, checksums)
+        checked_license_identity(provider, provider_files, JSONSCHEMA_REPOSITORY,
+                                 JSONSCHEMA_LICENSE_COMMIT, "crates/jsonschema", True)
+        data = provider_files.get("LICENSE", b"")
+        if sha256(data) != JSONSCHEMA_LICENSE_SHA256:
+            raise ValueError("license fallback workspace license text changed")
+        return {
+            "path": "workspace/jsonschema-0.60.1/LICENSE", "sha256": sha256(data), "text": data.decode("utf-8"),
+            "origin": {
+                "kind": "locked-workspace-license", "repository": JSONSCHEMA_REPOSITORY,
+                "commit": JSONSCHEMA_LICENSE_COMMIT,
+                "url": f"{JSONSCHEMA_REPOSITORY}/blob/{JSONSCHEMA_LICENSE_COMMIT}/LICENSE",
+                "workspace_manifest_url": f"{JSONSCHEMA_REPOSITORY}/blob/{JSONSCHEMA_LICENSE_COMMIT}/Cargo.toml",
+                "workspace_manifest_git_blob": "86bc8ad03d6c12e66ff40ab9af31ec16f41f1124",
+                "provider": {"name": "jsonschema", "version": "0.60.1", "source": provider["source"],
+                             "registry_archive_sha256": provider_checksum, "path": "LICENSE"},
+            },
+        }
+    if identity in UPSTREAM_LICENSE_PACKAGES:
+        checked_license_identity(package, files, SIMD_REPOSITORY,
+                                 SIMD_LICENSE_COMMIT, UPSTREAM_LICENSE_PACKAGES[identity], False)
+        source = SUPPLEMENT_ROOT / SIMD_LICENSE_FILE
+        if source.is_symlink() or not source.is_file():
+            raise ValueError("license fallback pinned upstream license is missing or unsafe")
+        data = source.read_bytes()
+        if sha256(data) != SIMD_LICENSE_SHA256:
+            raise ValueError("license fallback pinned upstream license text changed")
+        return {
+            "path": "upstream/Nugine-simd/LICENSE", "sha256": sha256(data), "text": data.decode("utf-8"),
+            "origin": {
+                "kind": "pinned-upstream-license", "repository": SIMD_REPOSITORY,
+                "commit": SIMD_LICENSE_COMMIT, "path": "LICENSE",
+                "url": f"{SIMD_REPOSITORY}/blob/{SIMD_LICENSE_COMMIT}/LICENSE",
+                "git_blob": "2c7eabb59093ea117d73b20effdd0414f87b2af2",
+                "vendored_path": SIMD_LICENSE_FILE,
+            },
+        }
+    return None
+
+
+def collect_package(package, checksums, inventory=()):
     name, version = package["name"], package["version"]
     label = f"{name} {version}"
     if package.get("source") not in REGISTRIES:
@@ -186,7 +298,10 @@ def collect_package(package, checksums):
         or document["path"] == declared
     )]
     if not license_documents:
-        raise ValueError(f"{label}: no supplied license text; SPDX metadata alone is insufficient")
+        supplement = fallback_license(package, files, checksums, inventory)
+        if supplement is None:
+            raise ValueError(f"{label}: no supplied license text; SPDX metadata alone is insufficient")
+        documents.append(supplement)
     if not package.get("license") and not declared:
         raise ValueError(f"{label}: neither license metadata nor license-file is declared")
     if name == "aws-lc-sys":
@@ -219,7 +334,7 @@ def make_bundle(metadata, target, lock_bytes, rust_version, stdlib_bytes):
     if not packages:
         raise ValueError("empty dependency resolution; refusing an empty notice bundle")
     checksums = locked_checksums(lock_bytes)
-    collected = [collect_package(package, checksums) for package in packages]
+    collected = [collect_package(package, checksums, packages) for package in packages]
     text = [
         "THIRD-PARTY NOTICES FOR RUSTA-PITEST\n",
         f"Target: {target}\nRust toolchain: {rust_version}\n",
@@ -227,7 +342,8 @@ def make_bundle(metadata, target, lock_bytes, rust_version, stdlib_bytes):
         "build and optional packages. Inclusion does not assert that a package is linked.\n"
         "License expressions are upstream metadata, not a choice of licensing terms.\n"
         "Supplied license/notice files and leading source attribution headers follow.\n"
-        "Files come from original registry archives verified against Cargo.lock.\n"
+        "Attributions come from registry archives verified against Cargo.lock or\n"
+        "explicitly pinned upstream supplements; origins are recorded per document.\n"
         "The exact toolchain's standard-library and bundled dependency notices are in\n"
         "RUST-STDLIB-LICENSE.html. System libraries supplied by the operating system\n"
         "are not copied into these release archives.\n",
@@ -240,6 +356,8 @@ def make_bundle(metadata, target, lock_bytes, rust_version, stdlib_bytes):
         text.append(f"Registry archive SHA-256: {package['registry_archive_sha256']}\n")
         for document in package["documents"]:
             text.append(f"\n--- {document['path']} (SHA-256 {document['sha256']}) ---\n")
+            if document.get("origin"):
+                text.append(f"Origin: {document['origin']['url']}\n")
             text.append(document["text"] + ("" if document["text"].endswith("\n") else "\n"))
         for header in package["source_headers"]:
             text.append("\n--- Source attribution: " + ", ".join(source["path"] for source in header["sources"]) + " ---\n")

@@ -2,8 +2,13 @@ mod bench;
 mod catalogue;
 mod cli;
 mod contract;
+mod model;
+mod openapi;
 mod output;
 mod profile;
+mod schema;
+mod strict_json;
+mod suite_run;
 mod wizard;
 
 use std::{path::Path, process::ExitCode};
@@ -18,17 +23,28 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     if cli.output.is_some()
         && (matches!(&cli.command, Some(Command::Catalogue))
+            || matches!(&cli.command, Some(Command::Openapi { .. }))
             || matches!(&cli.command, Some(Command::Profile(options)) if options.dry_run))
     {
         Cli::command()
             .error(
                 ErrorKind::ArgumentConflict,
-                "--output requires a benchmark; it cannot be used with catalogue or --dry-run",
+                "--output requires a benchmark or suite run; use --out with openapi generate",
             )
             .exit();
     }
     let destination = cli.output.as_deref();
     let (method, options, json) = match cli.command {
+        Some(Command::Openapi {
+            command: cli::OpenApiCommand::Generate { source, out },
+        }) => {
+            return generate_suite(&source, &out).await;
+        }
+        Some(Command::Suite {
+            command: cli::SuiteCommand::Run(options),
+        }) => {
+            return run_suite(options, destination).await;
+        }
         Some(Command::Catalogue) => {
             catalogue::print();
             return ExitCode::SUCCESS;
@@ -87,6 +103,95 @@ async fn main() -> ExitCode {
         },
         file,
     )
+}
+
+async fn generate_suite(source: &str, out: &Path) -> ExitCode {
+    let file = match output::ReportFile::prepare(out) {
+        Ok(file) => file,
+        Err(_) => {
+            eprintln!("Cannot prepare suite output; choose a new writable file path");
+            return ExitCode::FAILURE;
+        }
+    };
+    match openapi::generate(source).await {
+        Ok(suite) => {
+            let value = serde_json::to_value(&suite).expect("suite is serializable");
+            let bytes = serde_json::to_vec_pretty(&value).expect("suite is serializable");
+            if strict_json::parse_json_with_limit(&bytes, 4 * 1024 * 1024 - 1).is_err() {
+                eprintln!("Generated suite exceeds the supported size or complexity limits");
+                return ExitCode::FAILURE;
+            }
+            if file.finish_value(&value).is_err() {
+                eprintln!("Cannot publish suite output");
+                return ExitCode::FAILURE;
+            }
+            println!(
+                "Generated {} cases. Review the suite, then use suite run to preview it.",
+                suite.cases.len()
+            );
+            for case in &suite.cases {
+                println!(
+                    "{} {} — {}{}",
+                    case.method,
+                    case.path,
+                    case.id,
+                    if case.blockers.is_empty() {
+                        ""
+                    } else {
+                        " [blocked]"
+                    }
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("OpenAPI generation failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_suite(options: cli::SuiteOptions, destination: Option<&Path>) -> ExitCode {
+    let file = match prepare_report(destination) {
+        Ok(file) => file,
+        Err(code) => return code,
+    };
+    let result = suite_run::run(suite_run::RunOptions {
+        suite: options.suite,
+        base_url: options.base_url,
+        execute: options.execute,
+        operations: options.operations,
+        fixtures: options.fixtures,
+        auth_env: options.auth_env,
+        timeout_ms: options.timeout_ms,
+        rate_per_second: options.rate_per_second,
+        max_requests: options.max_requests,
+    })
+    .await;
+    match result {
+        Ok(report) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).expect("report is JSON")
+            );
+            let passed = report["passed"].as_bool().unwrap_or(!options.execute);
+            if let Some(file) = file
+                && file.finish_value(&report).is_err()
+            {
+                eprintln!("Cannot publish suite report");
+                return ExitCode::FAILURE;
+            }
+            if passed {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(error) => {
+            eprintln!("Suite preflight failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn prepare_report(destination: Option<&Path>) -> Result<Option<output::ReportFile>, ExitCode> {
