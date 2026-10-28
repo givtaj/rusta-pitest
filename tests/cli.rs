@@ -12,6 +12,7 @@ use std::{
 
 #[derive(Debug)]
 struct Request {
+    connection_id: usize,
     method: String,
     path: String,
     headers: Vec<(String, String)>,
@@ -51,7 +52,7 @@ impl Server {
                         // Accepted sockets inherit nonblocking mode on macOS.
                         // Request parsing below intentionally uses blocking I/O.
                         stream.set_nonblocking(false).unwrap();
-                        server_connections.fetch_add(1, Ordering::Relaxed);
+                        let connection_id = server_connections.fetch_add(1, Ordering::Relaxed);
                         let handler = Arc::clone(&handler);
                         workers.push(thread::spawn(move || {
                             stream
@@ -61,7 +62,7 @@ impl Server {
                                 .set_write_timeout(Some(Duration::from_secs(2)))
                                 .unwrap();
                             let mut requests = Vec::new();
-                            while let Some(request) = read_request(&mut stream) {
+                            while let Some(request) = read_request(&mut stream, connection_id) {
                                 handler(&request, &mut stream);
                                 requests.push(request);
                                 if !keep_alive {
@@ -96,7 +97,7 @@ impl Server {
     }
 }
 
-fn read_request(stream: &mut TcpStream) -> Option<Request> {
+fn read_request(stream: &mut TcpStream, connection_id: usize) -> Option<Request> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     if reader.read_line(&mut line).unwrap() == 0 {
@@ -127,6 +128,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
     let mut body = vec![0; length];
     reader.read_exact(&mut body).unwrap();
     Some(Request {
+        connection_id,
         method,
         path,
         headers,
@@ -232,35 +234,60 @@ fn concurrent_get_sends_exactly_the_requested_count() {
 }
 
 #[test]
-fn sequential_requests_reuse_one_connection_after_draining_chunked_bodies() {
-    let server = Server::start_with_keep_alive(true, |_, stream| {
+fn sequential_requests_drain_chunked_bodies_and_reuse_connections() {
+    let pending_body = Arc::new(AtomicBool::new(false));
+    let bodies_finished = Arc::new(AtomicUsize::new(0));
+    let server_pending = Arc::clone(&pending_body);
+    let server_finished = Arc::clone(&bodies_finished);
+    let server = Server::start_with_keep_alive(true, move |_, stream| {
+        assert!(
+            !server_pending.swap(true, Ordering::SeqCst),
+            "the next sequential request started before the previous body was released"
+        );
         stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n4\r\ndone\r\n0\r\n\r\n",
-            )
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n")
             .unwrap();
+        // A response must remain in flight after headers and its first chunk;
+        // dropping it early must not look like successful full-body timing.
+        thread::sleep(Duration::from_millis(10));
+        // Release the guard before writing EOF: a correct client can start its
+        // next request as soon as those bytes arrive, before this thread resumes.
+        server_pending.store(false, Ordering::SeqCst);
+        stream.write_all(b"4\r\ndone\r\n0\r\n\r\n").unwrap();
+        server_finished.fetch_add(1, Ordering::SeqCst);
     });
-    let output = run(&["get", &server.url, "--requests", "6"]);
+    let output = run(&["get", &server.url, "--requests", "16"]);
     let connections = Arc::clone(&server.connections);
     let requests = server.finish();
     assert_report(
         &output,
         0,
         &[
-            "Requests: 6",
-            "Succeeded: 6",
+            "Requests: 16",
+            "Succeeded: 16",
             "Unexpected status: 0",
             "Timeouts: 0",
             "Transport errors: 0",
-            "HTTP statuses (complete responses): 200=6",
-            "Latency samples: 6",
+            "HTTP statuses (complete responses): 200=16",
+            "Latency samples: 16",
         ],
     );
-    assert_eq!(requests.len(), 6);
-    assert_eq!(
-        connections.load(Ordering::Relaxed),
-        1,
-        "fully drained responses must allow HTTP/1.1 connection reuse"
+    assert_eq!(requests.len(), 16);
+    assert_eq!(bodies_finished.load(Ordering::SeqCst), 16);
+    let mut requests_per_connection = std::collections::BTreeMap::new();
+    for request in &requests {
+        *requests_per_connection
+            .entry(request.connection_id)
+            .or_insert(0) += 1;
+    }
+    // Hyper returns HTTP/1 connections to its pool on a separate readiness task
+    // and races checkout against connecting. Extra accepted sockets, including
+    // unused ones, do not prove a drain/reuse failure. Observe actual reuse over
+    // a bounded sample without requiring every request to use the same socket.
+    assert!(
+        requests_per_connection.values().any(|&count| count > 1),
+        "no connection was reused: accepted={}, requests_per_connection={requests_per_connection:?}",
+        connections.load(Ordering::Relaxed)
     );
 }
 

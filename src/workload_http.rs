@@ -917,6 +917,12 @@ mod tests {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
+        // A client can reject Content-Length before consuming the body. Drop
+        // joins this worker on the test's current-thread Tokio runtime, so it
+        // cannot rely on that runtime polling connection cleanup to unblock us.
+        stream
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
@@ -952,7 +958,9 @@ mod tests {
             "HTTP/1.1 {} Fixture\r\n{framing}\r\nConnection: close\r\n{}\r\n",
             response.status, response.headers
         );
-        let _ = stream.write_all(head.as_bytes());
+        if stream.write_all(head.as_bytes()).is_err() {
+            return;
+        }
         if method == "HEAD" {
             return;
         }
@@ -967,6 +975,8 @@ mod tests {
             }
             let _ = stream.write_all(b"0\r\n\r\n");
         } else {
+            // Early rejection, disconnect, and the bounded write timeout are
+            // expected fixture outcomes; do not retry a partially sent body.
             let _ = stream.write_all(&response.body);
         }
     }
@@ -1000,6 +1010,39 @@ mod tests {
             headers: "",
             chunked: false,
         }
+    }
+
+    #[test]
+    fn fixture_teardown_is_bounded_when_peer_does_not_read_response() {
+        let mut fixture = response(200, b"");
+        // Exceed normal socket buffers so the writer has to wait for a peer
+        // which stays connected but never consumes response headers or bytes.
+        fixture.body = vec![b'x'; 32 * MAX_RESPONSE_BYTES];
+        let server = Server::start(fixture);
+        let captured = Arc::clone(&server.captured);
+        let mut peer = TcpStream::connect((
+            server.url.host_str().unwrap(),
+            server.url.port_or_known_default().unwrap(),
+        ))
+        .unwrap();
+        peer.write_all(b"GET /prefix/nonreading HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let accepted_by = Instant::now() + Duration::from_secs(2);
+        while captured.lock().unwrap().is_empty() && Instant::now() < accepted_by {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(captured.lock().unwrap().len(), 1);
+        let (finished, completion) = std::sync::mpsc::channel();
+        let teardown = thread::spawn(move || {
+            drop(server);
+            finished.send(()).unwrap();
+        });
+        let bounded = completion.recv_timeout(Duration::from_secs(5)).is_ok();
+        // Also release an unfixed fixture before failing, rather than leaving
+        // its blocked writer behind or hanging this regression's own cleanup.
+        drop(peer);
+        teardown.join().unwrap();
+        assert!(bounded, "fixture teardown waited for a nonreading peer");
     }
 
     #[tokio::test]
