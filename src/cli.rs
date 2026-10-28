@@ -28,6 +28,11 @@ pub enum Command {
         #[command(subcommand)]
         command: SuiteCommand,
     },
+    /// Preview or execute an authored workload with isolated actors and fixed arrivals
+    Workload {
+        #[command(subcommand)]
+        command: WorkloadCommand,
+    },
     /// Open the guided request wizard (also used when no command is given)
     Wizard,
     /// List available targets without sending requests
@@ -65,6 +70,12 @@ pub enum OpenApiCommand {
         /// Write a new suite file; existing files are never overwritten
         #[arg(long, value_name = "FILE")]
         out: std::path::PathBuf,
+        /// Maximum contract bytes (1..=67108864); structural limits still apply
+        #[arg(long, default_value_t = 1048576, value_parser = clap::value_parser!(u64).range(1..=67108864))]
+        max_input_bytes: u64,
+        /// Maximum generated suite bytes (1..=67108864)
+        #[arg(long, default_value_t = 4194304, value_parser = clap::value_parser!(u64).range(1..=67108864))]
+        max_suite_bytes: u64,
     },
 }
 
@@ -74,9 +85,33 @@ pub enum SuiteCommand {
     Run(SuiteOptions),
 }
 
+#[derive(Subcommand)]
+pub enum WorkloadCommand {
+    /// Preview by default; execution requires an explicit target and operation selection
+    Run(WorkloadOptions),
+}
+
+#[derive(Args)]
+pub struct WorkloadOptions {
+    pub plan: std::path::PathBuf,
+    #[arg(long)]
+    pub execute: bool,
+    #[arg(long, value_parser = parse_url)]
+    pub base_url: Option<Url>,
+    /// Select every request used by the plan, including setup; repeat as needed
+    #[arg(long = "operation")]
+    pub operations: Vec<String>,
+    /// Permit selected POST/PUT/PATCH/DELETE operations after reviewing their bodies
+    #[arg(long)]
+    pub allow_writes: bool,
+}
+
 #[derive(Args)]
 pub struct SuiteOptions {
     pub suite: std::path::PathBuf,
+    /// Maximum suite bytes (1..=67108864); structural limits still apply
+    #[arg(long, default_value_t = 4194304, value_parser = clap::value_parser!(u64).range(1..=67108864))]
+    pub max_input_bytes: u64,
     /// Explicit API base URL, including an optional path prefix
     #[arg(long, value_parser = parse_url)]
     pub base_url: Option<Url>,

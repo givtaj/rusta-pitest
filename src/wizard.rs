@@ -383,8 +383,10 @@ fn ask<T>(
         drop(output);
 
         let mut line = String::new();
-        // EOF must cancel, not accept a default and accidentally send requests.
-        if io::stdin().read_line(&mut line)? == 0 {
+        // EOF, including an incomplete final line, must cancel before defaults
+        // or explicit answers can accidentally start requests. LF and CRLF count
+        // as completed lines; a bare CR does not.
+        if io::stdin().read_line(&mut line)? == 0 || !line.ends_with('\n') {
             return Err(PromptError::Cancelled);
         }
         let input = line.trim();

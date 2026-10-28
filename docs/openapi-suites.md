@@ -37,8 +37,27 @@ The importer supports OpenAPI 3.1.0, 3.1.1, and 3.1.2. Other versions receive an
 explicit error. These are supported-subset structural and semantic checks, not
 a claim to implement every OpenAPI validation rule. JSON/YAML duplicate keys,
 multiple documents, non-JSON-compatible YAML, and excessive nesting are rejected.
-Contracts are limited to 1 MiB, 256 operations, 128 parameters per list, and a
-bounded node count. Generated suites must fit the runner's 4 MiB and node limits.
+Alpha.3 limits contracts to 1 MiB and generated/input suites to 4 MiB.
+From alpha.4, explicit byte-limit options are available:
+
+| Command option | Default | Accepted range |
+| --- | --- | --- |
+| `openapi generate --max-input-bytes` | 1048576 (1 MiB) | 1–67108864 bytes |
+| `openapi generate --max-suite-bytes` | 4194304 (4 MiB) | 1–67108864 bytes |
+| `suite run --max-input-bytes` | 4194304 (4 MiB) | 1–67108864 bytes |
+
+These are byte budgets, not disabled validation. Structural limits are unchanged:
+256 operations, 128 parameters per list, bounded nodes/nesting, local references,
+and the supported serializer/schema subset still apply. A larger generated suite
+may also need a matching explicit input limit when previewing or executing it:
+
+```sh
+cargo run --locked -- openapi generate examples/widgets.openapi.yaml \
+  --max-input-bytes 8388608 --max-suite-bytes 16777216 \
+  --out /tmp/widgets-large-budget.suite.json
+cargo run --locked -- suite run /tmp/widgets-large-budget.suite.json \
+  --max-input-bytes 16777216
+```
 
 ## Bind an environment and execute
 
@@ -79,6 +98,8 @@ Security alternatives and combined requirements are preserved. A complete
 alternative must be configured; unsupported schemes do not silently become
 anonymous requests. OAuth acquisition, session/cookie flows, and certificate
 setup are outside this MVP. Contract-fetch credentials are never forwarded.
+The separate [workload runner](workloads.md), introduced in alpha.4, supports static
+actor cookie/header bindings; it does not change generated-suite authentication.
 
 Execution checks every selected case before the first request. A missing
 fixture/credential, invalid header, unsupported schema, or blocked operation
@@ -126,8 +147,10 @@ leave a case blocked when it cannot construct a valid candidate.
 
 Business meaning, real resource IDs, operation dependencies, eventual state,
 setup and cleanup cannot be inferred reliably. No cleanup or arbitrary hooks
-execute. Writes, external references, OpenAPI 3.0/3.2 adapters, and broader
-property-based/negative testing remain separate follow-on work.
+execute. Writes in generated suites, external references, OpenAPI 3.0/3.2 adapters,
+and broader property-based testing remain separate follow-on work. The separate
+authored workload runner supports explicit write and expected-denial plans;
+generated suites do not acquire those permissions automatically.
 
 ## Reports and editable suites
 

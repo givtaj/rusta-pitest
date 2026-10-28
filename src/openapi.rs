@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     model::{Case, Parameter, Source, Suite},
     schema,
-    strict_json::{self, MAX_DOCUMENT_BYTES},
+    strict_json::{self, MAX_CONFIGURED_BYTES},
 };
 
 const METHODS: [&str; 8] = [
@@ -24,8 +24,11 @@ type Security = Vec<BTreeMap<String, Vec<String>>>;
 
 /// Load only the requested contract document. No operation, reference, example,
 /// authentication, discovery, or documentation-page requests are made here.
-pub async fn generate(source: &str) -> Result<Suite, String> {
-    let bytes = load(source).await?;
+pub async fn generate(source: &str, max_input_bytes: u64) -> Result<Suite, String> {
+    if !(1..=MAX_CONFIGURED_BYTES).contains(&max_input_bytes) {
+        return Err("contract input limit must be between 1 byte and 64 MiB".into());
+    }
+    let bytes = load(source, max_input_bytes).await?;
     let start = bytes
         .iter()
         .copied()
@@ -36,9 +39,9 @@ pub async fn generate(source: &str) -> Result<Suite, String> {
         );
     }
     let contract = if matches!(start, Some(b'{' | b'[')) {
-        strict_json::parse_json(&bytes)?
+        strict_json::parse_json_with_limit(&bytes, max_input_bytes as usize)?
     } else {
-        strict_json::parse_yaml(&bytes)?
+        strict_json::parse_yaml_with_limit(&bytes, max_input_bytes as usize)?
     };
     let openapi_version = version(&contract)?.to_owned();
     let source = Source {
@@ -48,7 +51,7 @@ pub async fn generate(source: &str) -> Result<Suite, String> {
     from_contract(contract, source)
 }
 
-async fn load(source: &str) -> Result<Vec<u8>, String> {
+async fn load(source: &str, max_input_bytes: u64) -> Result<Vec<u8>, String> {
     if source.starts_with("http://") || source.starts_with("https://") {
         let url = Url::parse(source).map_err(|_| "invalid contract URL")?;
         if !url.username().is_empty() || url.password().is_some() {
@@ -79,9 +82,9 @@ async fn load(source: &str) -> Result<Vec<u8>, String> {
         }
         if response
             .content_length()
-            .is_some_and(|length| length > MAX_DOCUMENT_BYTES as u64)
+            .is_some_and(|length| length > max_input_bytes)
         {
-            return Err("contract document exceeds the 1 MiB size limit".into());
+            return Err("contract document exceeds the configured input limit".into());
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response
@@ -89,8 +92,8 @@ async fn load(source: &str) -> Result<Vec<u8>, String> {
             .await
             .map_err(|_| "cannot read contract response body")?
         {
-            if bytes.len().saturating_add(chunk.len()) > MAX_DOCUMENT_BYTES {
-                return Err("contract document exceeds the 1 MiB size limit".into());
+            if bytes.len().saturating_add(chunk.len()) as u64 > max_input_bytes {
+                return Err("contract document exceeds the configured input limit".into());
             }
             bytes.extend_from_slice(&chunk);
         }
@@ -101,11 +104,11 @@ async fn load(source: &str) -> Result<Vec<u8>, String> {
         }
         let file = File::open(source).map_err(|_| "cannot open contract file")?;
         let mut bytes = Vec::new();
-        file.take(MAX_DOCUMENT_BYTES as u64 + 1)
+        file.take(max_input_bytes + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| "cannot read contract file")?;
-        if bytes.len() > MAX_DOCUMENT_BYTES {
-            return Err("contract document exceeds the 1 MiB size limit".into());
+        if bytes.len() as u64 > max_input_bytes {
+            return Err("contract document exceeds the configured input limit".into());
         }
         Ok(bytes)
     }

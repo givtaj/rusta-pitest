@@ -1,6 +1,6 @@
 [package]
 name = "rusta-pitest"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 edition = "2024"
 description = "A small CLI for testing and benchmarking HTTP APIs"
 license = "Apache-2.0"
@@ -16,6 +16,7 @@ include = [
     "/src/**",
     "/tests/*.rs",
     "/examples/*.yaml",
+    "/examples/*.json",
     "/tests/test_build_provenance.py",
     "/tests/test_notices.py",
     "/scripts/release-smoke.py",
@@ -28,11 +29,14 @@ include = [
     "/CHANGELOG.md",
     "/docs/json-reports.md",
     "/docs/openapi-suites.md",
+    "/docs/workloads.md",
+    "/docs/codeql-alpha4-review.md",
     "/docs/roots-catalogue.md",
     "/docs/sleepapi-profile.md",
     "/docs/release-policy.md",
     "/docs/releases/v0.1.0-alpha.2.md",
     "/docs/releases/v0.1.0-alpha.3.md",
+    "/docs/releases/v0.1.0-alpha.4.md",
 ]
 
 [dependencies]
@@ -44,4 +48,7 @@ serde_json = "1"
 sha2 = "0.10"
 yaml_serde = "0.10"
 jsonschema = { version = "0.60", default-features = false }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

@@ -6,6 +6,7 @@ use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 
 pub const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
+pub const MAX_CONFIGURED_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DEPTH: usize = 64;
 const MAX_NODES: usize = 100_000;
 
@@ -149,19 +150,18 @@ pub fn parse_json_with_limit(bytes: &[u8], max_bytes: usize) -> Result<Value, St
     Ok(value)
 }
 
+#[cfg(test)]
 pub fn parse_yaml(bytes: &[u8]) -> Result<Value, String> {
-    check_size(bytes)?;
+    parse_yaml_with_limit(bytes, MAX_DOCUMENT_BYTES)
+}
+
+pub fn parse_yaml_with_limit(bytes: &[u8], max_bytes: usize) -> Result<Value, String> {
+    if bytes.len() > max_bytes {
+        return Err("document exceeds the configured size limit".into());
+    }
     yaml_serde::from_slice::<StrictValue>(bytes)
         .map(|value| value.0)
         .map_err(|error| safe_error("YAML", error))
-}
-
-fn check_size(bytes: &[u8]) -> Result<(), String> {
-    if bytes.len() > MAX_DOCUMENT_BYTES {
-        Err("document exceeds the 1 MiB size limit".into())
-    } else {
-        Ok(())
-    }
 }
 
 #[cfg(test)]

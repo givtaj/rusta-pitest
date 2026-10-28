@@ -1,0 +1,39 @@
+{
+  "workload_version": 1,
+  "actors": {
+    "alice": {"headers_env": {"Cookie": "RUSTA_DEMO_COOKIE_A", "X-CSRF-Token": "RUSTA_DEMO_CSRF_A"}},
+    "bob": {"headers_env": {"Cookie": "RUSTA_DEMO_COOKIE_B", "X-CSRF-Token": "RUSTA_DEMO_CSRF_B"}},
+    "canary": {"headers_env": {"Cookie": "RUSTA_DEMO_COOKIE_C", "X-CSRF-Token": "RUSTA_DEMO_CSRF_C"}}
+  },
+  "requests": {
+    "health": {"method": "GET", "path": "/health", "expect_status": 200},
+    "read": {
+      "method": "GET", "path": "/read", "expect_status": 200,
+      "response_schema": {"type": "object", "required": ["ok"], "properties": {"ok": {"const": true}}}
+    },
+    "denied": {
+      "method": "GET", "path": "/denied", "expect_status": 401,
+      "response_schema": {"type": "object", "required": ["denied"], "properties": {"denied": {"const": true}}}
+    }
+  },
+  "groups": {
+    "mixed": {"actors": ["alice", "bob"], "max_in_flight": 2, "requests": ["health", "read", "denied"]},
+    "canary": {"actors": ["canary"], "max_in_flight": 1, "requests": ["health"]}
+  },
+  "setup": [{"actor": "alice", "request": "health"}],
+  "phases": [
+    {"name": "baseline", "duration_ms": 1000, "rates": {"mixed": 3, "canary": 1}},
+    {"name": "load", "duration_ms": 4000, "rates": {"mixed": 6, "canary": 1}}
+  ],
+  "max_in_flight": 3,
+  "timeout_ms": 1000,
+  "drain_timeout_ms": 1000,
+  "max_start_lag_ms": 100,
+  "thresholds": [
+    {"metric": "error_rate", "maximum": 0},
+    {"metric": "unsent_rate", "maximum": 0},
+    {"metric": "p95_ms", "maximum": 500, "group": "canary", "min_samples": 5},
+    {"metric": "max_ms", "maximum": 1000, "request": "read", "phase": "load"}
+  ],
+  "evidence": {"max_records": 1000, "max_bytes": 262144}
+}

@@ -461,6 +461,57 @@ fn authenticated_execution_preserves_base_prefix_escapes_fixture_and_redacts_rep
 }
 
 #[test]
+fn simple_path_fixtures_reach_the_wire_encoded_once_with_literal_and_base_prefixes() {
+    let directory = TempDir::new();
+    let mut contract = widget_contract(false);
+    let operation = contract["paths"]
+        .as_object_mut()
+        .unwrap()
+        .remove("/widgets/{id}")
+        .unwrap();
+    contract["paths"]["/literal;part,part/prefix-{id}.json"] = operation;
+    let suite = directory.generate(&contract);
+    let server = Server::start(|_| Response::json(200, json!({"id":"w1","name":"Widget"})));
+    let base = format!("{}/api/encoded%2Fprefix/", server.url);
+    let fixtures = [
+        ("a;b,c", "a%3Bb%2Cc"),
+        ("a/b?x#y", "a%2Fb%3Fx%23y"),
+        ("%2F%2e%2e", "%252F%252e%252e"),
+        ("☃/{id}", "%E2%98%83%2F%7Bid%7D"),
+    ];
+    for (fixture, _) in fixtures {
+        let binding = format!("getWidget.path.id={fixture}");
+        assert_exit(
+            &run(
+                &directory.0,
+                &[
+                    "suite",
+                    "run",
+                    &suite,
+                    "--base-url",
+                    &base,
+                    "--operation",
+                    "getWidget",
+                    "--fixture",
+                    &binding,
+                    "--execute",
+                ],
+            ),
+            true,
+        );
+    }
+    let requests = server.finish();
+    assert_eq!(requests.len(), fixtures.len());
+    for (request, (_, encoded)) in requests.iter().zip(fixtures) {
+        assert_eq!(request.method, "GET");
+        assert_eq!(
+            request.path,
+            format!("/api/encoded%2Fprefix/literal;part,part/prefix-{encoded}.json")
+        );
+    }
+}
+
+#[test]
 fn invalid_response_schema_and_documented_error_status_fail_positive_cases() {
     for (status, body) in [
         (200, json!({"id":"fixture-without-name"})),

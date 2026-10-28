@@ -38,6 +38,17 @@ requirements, authentication/header conflicts, request budgets, rate pacing,
 full-response timeouts, and response-size limits against disposable loopback
 fixtures. These checks do not authorize traffic to external services.
 
+From alpha.4 onward, built and extracted binaries must additionally pass authored
+workload preview without secrets/traffic, isolated actor headers, expected denial,
+schema-v2 accounting/redaction, explicit write refusal and opted-in immutable replay,
+threshold-failure and bounded-evidence-loss smokes. Artifact checks also exercise
+OpenAPI byte-limit options, reserved-character path encoding, and incomplete-line
+EOF cancellation. Full regressions cover fixed arrivals under slowdown, reserved
+group capacity, phase/scoped-threshold attribution, interrupted drain, and bounded
+large-plan bookkeeping. Distribution checks verify included docs/examples and
+preview the extracted workload example. Functional fixture completion must be
+bounded, including teardown after a client rejects a response early.
+
 The initial public alpha has 46 Rust tests. The Python suite includes four
 offline build-provenance regressions and notice-generation tests. The final
 published release records the observed counts; all discovered tests must pass.
@@ -66,8 +77,11 @@ security audit.
 There is no universal requests-per-second or latency threshold for an HTTP test
 runner. Results depend on the tested API, host, network, concurrency, payload,
 and response size. This alpha gates on correct accounting and bounded test
-completion, not a speed claim. It does not yet implement configurable latency,
-throughput, or tolerated-error-rate pass/fail thresholds.
+completion, not a speed claim. Authored workloads provide configurable latency,
+start-lag, scheduled-to-terminal, error-rate and unsent-rate thresholds with
+explicit scope/sample requirements. These are caller-defined acceptance criteria,
+not universal release performance targets. Direct benchmarks and generated suites
+retain their documented pass rules; configurable throughput thresholds are absent.
 
 Start at concurrency 1–4 and increase cautiously while observing the client and
 target service. No maximum safe concurrency or capacity has been established;
@@ -89,8 +103,15 @@ other external service.
   header API-key authentication, with explicitly selected GET/HEAD execution.
   Neither mode enables proxies, automatic retries, redirects, warmup, or
   distributed load generation.
-- JSON schema version 1 is documented but remains an alpha interface. Future
-  incompatible changes must be called out and use an appropriate schema version.
+- Authored workloads support static per-actor cookie/custom-header bindings,
+  fixed arrivals, reserved groups, phases, explicit setup and request sequences,
+  and selected opted-in POST/PUT/PATCH/DELETE operations. Bodies and replay keys
+  are immutable; managed login/renewal and target lifecycle/cleanup are outside
+  scope. Proxies, redirects, hidden retries and unbounded queues remain disabled.
+- Request/profile/suite reports retain JSON schema version 1. Authored workload
+  reports use schema version 2 and workload version 1; consumers must check both
+  schema version and kind. All remain alpha interfaces. Future incompatible
+  changes must be called out and use an appropriate schema version.
 
 ## Release procedure
 
@@ -109,6 +130,8 @@ other external service.
    verify SHA-256 checksums. Generate each target's dependency notices and include
    `THIRD-PARTY-NOTICES.txt`, `THIRD-PARTY-MANIFEST.json`, and
    `RUST-STDLIB-LICENSE.html` in the archive and its internal checksum list.
+   Include the tracked docs/examples with their relative paths and verify every
+   payload file recursively against internal checksums after extraction.
 5. Publish a GitHub prerelease only when all required thresholds pass. Attach
    platform archives and `SHA256SUMS`; record the commit, successful workflow
    links, supported platforms, and known limitations in the release notes.
