@@ -823,6 +823,74 @@ fn execute_http(_group: String, client: Client, request: Arc<PreparedRequest>) -
     Box::pin(async move { workload_http::execute(&client, &request).await })
 }
 
+async fn finish_drain(
+    tasks: &mut JoinSet<Completion>,
+    active: &mut BTreeMap<u64, Active>,
+    recorder: &mut Recorder,
+    sequence_counts: &mut Counts,
+) -> Result<bool, String> {
+    // Completed tasks stay in JoinSet until collected; abort_all cannot undo
+    // their outcomes. Abort pending work first and preserve every completed join.
+    tasks.abort_all();
+    let mut incomplete = false;
+    let mut task_failed = false;
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(completion) => {
+                let request = active.remove(&completion.id).expect("tracked request");
+                recorder.finish(
+                    &request,
+                    &completion.outcome,
+                    completion.started,
+                    completion.finished,
+                );
+                let remaining = request.step + 1 < request.steps.len();
+                if remaining {
+                    recorder.unsent(
+                        &request,
+                        request.step + 1,
+                        if completion.outcome.passed {
+                            "drain_timeout"
+                        } else {
+                            "dependency_failed"
+                        },
+                    );
+                }
+                if request.sequence.is_some() {
+                    if !completion.outcome.passed {
+                        sequence_counts.completed += 1;
+                        sequence_counts.failed += 1;
+                    } else if remaining {
+                        sequence_counts.cancelled += 1;
+                        incomplete = true;
+                    } else {
+                        sequence_counts.completed += 1;
+                        sequence_counts.passed += 1;
+                    }
+                }
+            }
+            Err(error) => {
+                task_failed |= !error.is_cancelled();
+            }
+        }
+    }
+    incomplete |= !active.is_empty();
+    for request in active.values() {
+        if recorder.cancel(request) {
+            recorder.unsent(request, request.step + 1, "run_cancelled");
+        }
+        if request.sequence.is_some() {
+            sequence_counts.cancelled += 1;
+        }
+    }
+    active.clear();
+    if task_failed {
+        Err("workload_task_failed".into())
+    } else {
+        Ok(incomplete)
+    }
+}
+
 fn spawn(
     active: &mut Active,
     id: u64,
@@ -1028,18 +1096,9 @@ async fn run_with_executor(options: Options, executor: Executor) -> Result<Value
                 break;
             }
             if drain_end.is_some_and(|deadline| now >= deadline) {
-                tasks.abort_all();
-                for request in active.values() {
-                    if recorder.cancel(request) {
-                        recorder.unsent(request, request.step + 1, "run_cancelled");
-                    }
-                    if request.sequence.is_some() {
-                        sequence_counts.cancelled += 1;
-                    }
-                }
-                capture_incomplete = true;
-                active.clear();
-                while tasks.join_next().await.is_some() {}
+                capture_incomplete |=
+                    finish_drain(&mut tasks, &mut active, &mut recorder, &mut sequence_counts)
+                        .await?;
                 break;
             }
         }
@@ -1461,21 +1520,76 @@ mod tests {
         assert_eq!(counts.json()["offered"], 10);
     }
 
+    fn write_new_plan(path: &std::path::Path, value: &Value) -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new();
+        file.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            file.mode(0o600);
+        }
+        // create_new refuses both existing files and symlinks atomically; never
+        // truncate an attacker-precreated path in a shared temporary directory.
+        let file = file.open(path)?;
+        serde_json::to_writer(file, value).map_err(std::io::Error::other)
+    }
+
     fn options(value: Value) -> Options {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "rusta-workload-unit-{}-{}.json",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-        Options {
-            plan: path,
-            execute: true,
-            base_url: Some(Url::parse("http://127.0.0.1:1").unwrap()),
-            operations: vec!["read".into()],
-            allow_writes: false,
+        for _ in 0..64 {
+            let path = std::env::temp_dir().join(format!(
+                "rusta-workload-unit-{}-{}.json",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match write_new_plan(&path, &value) {
+                Ok(()) => {
+                    return Options {
+                        plan: path,
+                        execute: true,
+                        base_url: Some(Url::parse("http://127.0.0.1:1").unwrap()),
+                        operations: vec!["read".into()],
+                        allow_writes: false,
+                    };
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("cannot create unit-test plan: {error}"),
+            }
         }
+        panic!("cannot reserve a new unit-test plan filename");
+    }
+
+    #[test]
+    fn unit_plan_creation_preserves_preexisting_files_and_symlinks() {
+        let options = options(minimal_value());
+        let path = options.plan;
+        let original = std::fs::read(&path).unwrap();
+        assert_eq!(
+            write_new_plan(&path, &json!({"replacement":true}))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o077,
+                0
+            );
+            let symlink = path.with_extension("symlink.json");
+            std::os::unix::fs::symlink(&path, &symlink).unwrap();
+            assert_eq!(
+                write_new_plan(&symlink, &json!({"replacement":true}))
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::AlreadyExists
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            std::fs::remove_file(symlink).unwrap();
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     fn fake_http(group: String, _client: Client, _request: Arc<PreparedRequest>) -> ExecuteFuture {
@@ -1753,5 +1867,193 @@ mod tests {
                 .as_f64()
                 .is_some()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_preserves_success_that_completed_before_it_was_collected() {
+        let plan = plan();
+        let origin = Instant::now();
+        let cursor = cursors(&plan).remove(0);
+        let mut recorder = Recorder {
+            origin,
+            metrics: BTreeMap::new(),
+            capture: Capture::new(&EvidenceOptions::default()),
+            next_request: 0,
+        };
+        let mut request = arrival(&plan, &cursor, origin);
+        recorder.series("read", "load", "normal").counts.offered = 1;
+        recorder.start(&mut request);
+        *request.actual_started.lock().unwrap() = Some(origin);
+        let mut active = BTreeMap::from([(1, request)]);
+        let mut tasks = JoinSet::new();
+        let handle = tasks.spawn(async move {
+            Completion {
+                id: 1,
+                outcome: Outcome {
+                    passed: true,
+                    status: Some(200),
+                    reason: "passed",
+                    response_complete: true,
+                },
+                started: origin,
+                finished: Instant::now(),
+            }
+        });
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_millis(2)).await;
+        let mut sequences = Counts::default();
+        let incomplete = finish_drain(&mut tasks, &mut active, &mut recorder, &mut sequences)
+            .await
+            .unwrap();
+        let counts = &recorder.metrics[&("read".into(), "load".into(), "normal".into())].counts;
+        assert_eq!(counts.completed, 1);
+        assert_eq!(counts.passed, 1);
+        assert_eq!(counts.complete_http_responses, 1);
+        assert_eq!(counts.cancelled, 0);
+        assert!(!incomplete);
+        assert!(active.is_empty() && tasks.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_preserves_failure_and_cancels_only_unfinished_sequence_requests() {
+        let mut plan = plan();
+        let group = plan.groups.get_mut("load").unwrap();
+        group.requests.clear();
+        group.sequence = vec![
+            Step {
+                request: "read".into(),
+                replay_of: None,
+            },
+            Step {
+                request: "read".into(),
+                replay_of: None,
+            },
+        ];
+        let origin = Instant::now();
+        let cursor = cursors(&plan).remove(0);
+        let mut recorder = Recorder {
+            origin,
+            metrics: BTreeMap::new(),
+            capture: Capture::new(&EvidenceOptions::default()),
+            next_request: 0,
+        };
+        recorder.series("read", "load", "normal").counts.offered = 4;
+        let mut active = BTreeMap::new();
+        for id in 1..=2 {
+            let mut request = arrival(&plan, &cursor, origin);
+            recorder.start(&mut request);
+            *request.actual_started.lock().unwrap() = Some(origin);
+            active.insert(id, request);
+        }
+        let mut tasks = JoinSet::new();
+        let handle = tasks.spawn(async move {
+            Completion {
+                id: 1,
+                outcome: Outcome {
+                    passed: false,
+                    status: Some(500),
+                    reason: "unexpected_status",
+                    response_complete: true,
+                },
+                started: origin,
+                finished: Instant::now(),
+            }
+        });
+        tasks.spawn(std::future::pending());
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut sequences = Counts {
+            offered: 2,
+            started: 2,
+            ..Counts::default()
+        };
+        assert!(
+            finish_drain(&mut tasks, &mut active, &mut recorder, &mut sequences)
+                .await
+                .unwrap()
+        );
+        let counts = &recorder.metrics[&("read".into(), "load".into(), "normal".into())].counts;
+        assert_eq!(counts.offered, 4);
+        assert_eq!(counts.started, 2);
+        assert_eq!(counts.completed, 1);
+        assert_eq!(counts.failed, 1);
+        assert_eq!(counts.cancelled, 1);
+        assert_eq!(counts.unsent, 2);
+        assert_eq!(counts.complete_http_responses, 1);
+        assert_eq!(counts.reasons["dependency_failed"], 1);
+        assert_eq!(sequences.completed, 1);
+        assert_eq!(sequences.failed, 1);
+        assert_eq!(sequences.cancelled, 1);
+        assert_eq!(counts.json()["in_flight"], 0);
+        assert!(active.is_empty() && tasks.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_preserves_completed_sequence_child_and_marks_only_its_tail_unsent() {
+        let mut plan = plan();
+        let group = plan.groups.get_mut("load").unwrap();
+        group.requests.clear();
+        group.sequence = vec![
+            Step {
+                request: "read".into(),
+                replay_of: None,
+            },
+            Step {
+                request: "read".into(),
+                replay_of: None,
+            },
+        ];
+        let origin = Instant::now();
+        let cursor = cursors(&plan).remove(0);
+        let mut recorder = Recorder {
+            origin,
+            metrics: BTreeMap::new(),
+            capture: Capture::new(&EvidenceOptions::default()),
+            next_request: 0,
+        };
+        recorder.series("read", "load", "normal").counts.offered = 2;
+        let mut request = arrival(&plan, &cursor, origin);
+        recorder.start(&mut request);
+        *request.actual_started.lock().unwrap() = Some(origin);
+        let mut active = BTreeMap::from([(1, request)]);
+        let mut tasks = JoinSet::new();
+        let handle = tasks.spawn(async move {
+            Completion {
+                id: 1,
+                outcome: Outcome {
+                    passed: true,
+                    status: Some(200),
+                    reason: "passed",
+                    response_complete: true,
+                },
+                started: origin,
+                finished: Instant::now(),
+            }
+        });
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut sequences = Counts {
+            offered: 1,
+            started: 1,
+            ..Counts::default()
+        };
+        assert!(
+            finish_drain(&mut tasks, &mut active, &mut recorder, &mut sequences)
+                .await
+                .unwrap()
+        );
+        let counts = &recorder.metrics[&("read".into(), "load".into(), "normal".into())].counts;
+        assert_eq!(counts.completed, 1);
+        assert_eq!(counts.passed, 1);
+        assert_eq!(counts.cancelled, 0);
+        assert_eq!(counts.unsent, 1);
+        assert_eq!(counts.reasons["drain_timeout"], 1);
+        assert_eq!(sequences.cancelled, 1);
+        assert_eq!(sequences.completed, 0);
+        assert_eq!(counts.json()["in_flight"], 0);
     }
 }

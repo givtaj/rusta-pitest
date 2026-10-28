@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing version tag to build (for example v0.1.0-alpha.2)
+        description: Existing version tag to build (for example v0.1.0-alpha.4)
         required: true
         type: string
 
@@ -101,8 +101,15 @@ jobs:
           package = output / name
           package.mkdir(parents=True)
           notice_files = ['THIRD-PARTY-NOTICES.txt', 'THIRD-PARTY-MANIFEST.json', 'RUST-STDLIB-LICENSE.html']
-          for source in ['target/release/rusta-pitest', 'README.md', 'LICENSE', *(str(Path('target/notices') / filename) for filename in notice_files)]:
+          for source in ['target/release/rusta-pitest', 'README.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'SECURITY.md', 'LICENSE', *(str(Path('target/notices') / filename) for filename in notice_files)]:
               shutil.copy2(source, package)
+          # Preserve tracked relative links and the complete authored example.
+          for relative in subprocess.check_output(['git', 'ls-files', 'docs', 'examples'], text=True).splitlines():
+              source = Path(relative)
+              assert source.is_file() and not source.is_symlink()
+              destination = package / source
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(source, destination)
           provenance = {
               'version': os.environ['RELEASE_TAG'].removeprefix('v'),
               'tag': os.environ['RELEASE_TAG'],
@@ -116,7 +123,8 @@ jobs:
           (package / 'build-info.json').write_text(json.dumps(provenance, indent=2) + '\n')
           def digest(path):
               return hashlib.sha256(path.read_bytes()).hexdigest()
-          (package / 'SHA256SUMS').write_text(''.join(f'{digest(p)}  {p.name}\n' for p in sorted(package.iterdir())))
+          payload_files = sorted(path for path in package.rglob('*') if path.is_file())
+          (package / 'SHA256SUMS').write_text(''.join(f'{digest(path)}  {path.relative_to(package).as_posix()}\n' for path in payload_files))
           archive = output / f'{name}.tar.gz'
           with tarfile.open(archive, 'w:gz') as tar:
               tar.add(package, arcname=name)
@@ -124,15 +132,30 @@ jobs:
           # Test the distributable contents rather than only the build directory.
           unpacked = output / 'unpacked'
           unpacked.mkdir()
-          expected_members = {name, *(f'{name}/{p.name}' for p in package.iterdir())}
+          expected_members = {name, *(f'{name}/{path.relative_to(package).as_posix()}' for path in package.rglob('*'))}
           with tarfile.open(archive) as tar:
               assert {member.name for member in tar.getmembers()} == expected_members
               assert all(member.isfile() or member.isdir() for member in tar.getmembers())
           subprocess.run(['tar', '-xzf', str(archive), '-C', str(unpacked)], check=True)
+          checksummed = set()
           for line in (unpacked / name / 'SHA256SUMS').read_text().splitlines():
               expected, filename = line.split('  ', 1)
+              assert filename not in checksummed
+              checksummed.add(filename)
               assert digest(unpacked / name / filename) == expected
+          assert checksummed == {path.relative_to(unpacked / name).as_posix() for path in (unpacked / name).rglob('*') if path.is_file() and path != unpacked / name / 'SHA256SUMS'}
+          required_files = [f'docs/releases/{os.environ["RELEASE_TAG"]}.md']
+          has_workloads = Path('src/workload.rs').is_file()
+          if has_workloads:
+              required_files += ['docs/workloads.md', 'docs/openapi-suites.md', 'docs/json-reports.md', 'examples/workload.json', 'examples/widgets.openapi.yaml']
+          for required in required_files:
+              assert (unpacked / name / required).is_file(), required
           subprocess.run(['python3', 'scripts/release-smoke.py', str(unpacked / name / 'rusta-pitest'), '--expected-version', provenance['version'], '--expected-revision', provenance['git_revision'], '--expected-target', provenance['target'], '--require-clean'], check=True)
+          if has_workloads:
+              preview = json.loads(subprocess.check_output([str((unpacked / name / 'rusta-pitest').resolve()), 'workload', 'run', str((unpacked / name / 'examples/workload.json').resolve())], text=True))
+              assert preview['kind'] == 'workload' and preview['schema_version'] == 2
+              assert preview['executed'] is False and preview['runtime_secrets_loaded'] is False
+              assert preview['planned_requests'] == 32
           PY
 
       - name: Upload verified release artifacts

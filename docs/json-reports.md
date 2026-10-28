@@ -4,7 +4,7 @@ Check both `schema_version` and `kind` when consuming reports. This document
 describes `kind: request` and `kind: profile`. OpenAPI suite reports use
 `kind: suite` and a separate preview/execution shape described in
 [OpenAPI suites](openapi-suites.md#reports-and-editable-suites).
-The unreleased authored workload runner uses `schema_version: 2` and
+The authored workload runner, introduced in alpha.4, uses `schema_version: 2` and
 `kind: workload`; see [its report definitions](workloads.md#reports-and-thresholds).
 Do not parse its lifecycle counters as the version-1 benchmark metrics below.
 
@@ -110,7 +110,7 @@ Cancelled wizard runs create no files. `--output` with `catalogue` or
 `profile --dry-run` is rejected with exit `2` because neither produces measured
 results. An interrupted direct/profile process does not publish a completed
 report and may leave a `.rusta-pitest-*.tmp` file in the destination directory.
-The development workload runner handles Ctrl-C with a bounded drain and can
+The workload runner handles Ctrl-C with a bounded drain and can
 publish an explicitly interrupted report; abrupt termination can still prevent
 publication. Its bounded evidence capture reports dropped records separately
 from aggregate counts and never claims a complete run after interruption.

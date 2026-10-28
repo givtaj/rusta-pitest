@@ -37,8 +37,8 @@ The importer supports OpenAPI 3.1.0, 3.1.1, and 3.1.2. Other versions receive an
 explicit error. These are supported-subset structural and semantic checks, not
 a claim to implement every OpenAPI validation rule. JSON/YAML duplicate keys,
 multiple documents, non-JSON-compatible YAML, and excessive nesting are rejected.
-Published alpha.3 limits contracts to 1 MiB and generated/input suites to 4 MiB.
-The development branch adds explicit byte-limit options:
+Alpha.3 limits contracts to 1 MiB and generated/input suites to 4 MiB.
+From alpha.4, explicit byte-limit options are available:
 
 | Command option | Default | Accepted range |
 | --- | --- | --- |
@@ -98,7 +98,7 @@ Security alternatives and combined requirements are preserved. A complete
 alternative must be configured; unsupported schemes do not silently become
 anonymous requests. OAuth acquisition, session/cookie flows, and certificate
 setup are outside this MVP. Contract-fetch credentials are never forwarded.
-The separate [unreleased workload runner](workloads.md) supports authored static
+The separate [workload runner](workloads.md), introduced in alpha.4, supports static
 actor cookie/header bindings; it does not change generated-suite authentication.
 
 Execution checks every selected case before the first request. A missing
@@ -148,7 +148,7 @@ leave a case blocked when it cannot construct a valid candidate.
 Business meaning, real resource IDs, operation dependencies, eventual state,
 setup and cleanup cannot be inferred reliably. No cleanup or arbitrary hooks
 execute. Writes in generated suites, external references, OpenAPI 3.0/3.2 adapters,
-and broader property-based testing remain separate follow-on work. The unreleased
+and broader property-based testing remain separate follow-on work. The separate
 authored workload runner supports explicit write and expected-denial plans;
 generated suites do not acquire those permissions automatically.
 

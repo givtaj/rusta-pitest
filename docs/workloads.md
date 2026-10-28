@@ -1,7 +1,9 @@
-# Authored workloads (unreleased)
+# Authored workloads
 
-The development branch adds `workload run`; the published `v0.1.0-alpha.3`
-package does not include it. Build this checkout to use the commands below.
+Introduced in `v0.1.0-alpha.4`, `workload run` executes reviewed JSON plans.
+Examples below use `cargo run` from a source checkout; an installed executable
+uses `rusta-pitest` with the same arguments. Binary archives include `docs/` and
+`examples/` for local reference and preview.
 Existing direct benchmarks remain closed loop and generated OpenAPI suites
 remain once-per-selected-GET/HEAD contract checks. A workload is a separate,
 reviewed JSON plan, not an OpenAPI importer or a recorded production session.

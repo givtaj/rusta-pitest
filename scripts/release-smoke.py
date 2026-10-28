@@ -33,9 +33,12 @@ def main():
     requests = []
     api_headers = []
     workload_headers = []
+    workload_writes = []
     lock = threading.Lock()
     api_token = "rusta-smoke-auth-secret"
     fixture_id = "rusta-smoke-fixture-secret"
+    reserved_fixture_id = "rusta-smoke;reserved,secret"
+    reserved_fixture_path = "/api/v1/widgets/rusta-smoke%3Breserved%2Csecret"
     workload_cookie = "session=rusta-workload-cookie-secret"
     workload_csrf = "rusta-workload-csrf-secret"
     workload_path = "/workload-smoke/runtime-private-path"
@@ -103,6 +106,9 @@ def main():
                     "ok": authenticated, "denied": not authenticated,
                     "private": "rusta-workload-response-secret",
                 }).encode()
+            elif self.path == "/workload-write":
+                with lock:
+                    workload_writes.append((body, self.headers.get("Idempotency-Key")))
             elif self.path.startswith("/api/v1/"):
                 authorization = self.headers.get("Authorization")
                 with lock:
@@ -113,6 +119,8 @@ def main():
                     status, payload = 204, b""
                 elif self.path == f"/api/v1/widgets/{fixture_id}" and self.command == "GET":
                     payload = json.dumps({"id": fixture_id, "name": "Synthetic widget"}).encode()
+                elif self.path == reserved_fixture_path and self.command == "GET":
+                    payload = json.dumps({"id": reserved_fixture_id, "name": "Synthetic widget"}).encode()
                 elif self.path == f"/api/v1/broken/{fixture_id}" and self.command == "GET":
                     payload = json.dumps({"id": fixture_id, "name": 7,
                                           "private": "rusta-smoke-response-secret"}).encode()
@@ -187,6 +195,9 @@ def main():
             run(["catalogue"])
             run(["profile", "sleepapi", "--dry-run"])
             run(["wizard"], stdin="q\n")
+            for partial in (" ", "\t", "y", "yes"):
+                cancelled = run(["wizard"], stdin=f"3\n{origin}/wizard-must-not-run\n\n\n\n{partial}")
+                assert "Cancelled." in cancelled.stdout, "partial EOF must cancel final confirmation"
             run(["get", origin, "--requests", "0"], expected=2)
             assert not requests, "preview, cancellation and invalid input must send no traffic"
 
@@ -275,6 +286,20 @@ components:
             assert (directory / "suite.json").read_bytes() == original_suite
             assert len(requests) == before
 
+            # Explicit byte budgets must be recognized and enforced by this
+            # executable, not merely by the source-level integration tests.
+            run(["openapi", "generate", "contract.json", "--out", "too-small-input.json",
+                 "--max-input-bytes", "1"], expected=1)
+            run(["openapi", "generate", "contract.json", "--out", "too-small-suite.json",
+                 "--max-suite-bytes", "1"], expected=1)
+            assert not (directory / "too-small-input.json").exists()
+            assert not (directory / "too-small-suite.json").exists()
+            run(["openapi", "generate", "contract.json", "--out", "budget-suite.json",
+                 "--max-input-bytes", "8388608", "--max-suite-bytes", "16777216"])
+            run(["suite", "run", "budget-suite.json", "--max-input-bytes", "1"], expected=1)
+            run(["suite", "run", "budget-suite.json", "--max-input-bytes", "16777216"])
+            assert len(requests) == before, "local byte-budget checks must send no traffic"
+
             run(["openapi", "generate", f"{origin}/openapi.json", "--out", "url-suite.json"])
             assert len(requests) == before + 1
             assert requests[-1][:2] == ("GET", "/openapi.json")
@@ -288,7 +313,7 @@ components:
                 check_identity(document["runner"])
                 for key in ("source_digest", "contract_digest", "suite_digest"):
                     assert re.fullmatch(r"[0-9a-f]{64}", document[key])
-                for secret in (api_token, fixture_id, "rusta-smoke-response-secret"):
+                for secret in (api_token, fixture_id, reserved_fixture_id, "rusta-smoke-response-secret"):
                     assert secret not in json.dumps(document), "suite report disclosed runtime data"
                     assert secret not in result.stdout and secret not in result.stderr
                 return document
@@ -324,6 +349,11 @@ components:
             assert head["passed"] is True and head["counts"]["passed"] == 1
             row = next(case for case in head["cases"] if case["id"] == "headEmpty")
             assert row["checks"]["body_schema"] == "not_applicable"
+            reserved = suite_report("suite-reserved-fixture", [*target,
+                "--operation", "getWidget", "--fixture", f"getWidget.path.id={reserved_fixture_id}",
+                "--execute"], environment=environment)
+            assert reserved["passed"] is True
+            assert requests[-1][:2] == ("GET", reserved_fixture_path)
             failure = suite_report("suite-schema-failure", [*target, "--operation", "getBroken",
                 "--fixture", f"getBroken.path.id={fixture_id}", "--execute"],
                 expected=1, environment=environment)
@@ -342,7 +372,7 @@ components:
                            for method, path, _ in requests)
 
             # Exercise the separate workload CLI from the packaged executable.
-            # One offered request per group keeps counts exact without a timing
+            # One offered request per group/phase keeps counts exact without a timing
             # or service-capacity claim, while sharing the transport across actors.
             workload = {
                 "workload_version": 1,
@@ -371,13 +401,14 @@ components:
                     "denied": {"actors": ["anonymous"], "max_in_flight": 1,
                                "requests": ["deniedRead"]},
                 },
-                "phases": [{"name": "smoke", "duration_ms": 500,
-                            "rates": {"allowed": 1, "denied": 1}}],
+                "phases": [{"name": name, "duration_ms": 250,
+                            "rates": {"allowed": 1, "denied": 1}}
+                           for name in ("first", "second")],
                 "max_in_flight": 2, "timeout_ms": 2000,
                 "drain_timeout_ms": 2000, "max_start_lag_ms": 500,
                 "thresholds": [{"metric": "error_rate", "maximum": 0},
                                {"metric": "unsent_rate", "maximum": 0}],
-                "evidence": {"max_records": 4, "max_bytes": 4096},
+                "evidence": {"max_records": 8, "max_bytes": 4096},
             }
             (directory / "workload.json").write_text(json.dumps(workload))
             workload_target = ["workload", "run", "workload.json", "--base-url", origin]
@@ -391,7 +422,7 @@ components:
             assert preview["workload_version"] == 1 and preview["mode"] == "preview"
             assert preview["executed"] is False and preview["passed"] is None
             assert preview["runtime_secrets_loaded"] is False
-            assert preview["planned_requests"] == 2
+            assert preview["planned_requests"] == 4
             check_identity(preview["runner"])
             assert len(requests) == before, "workload preview must send no traffic"
 
@@ -410,19 +441,20 @@ components:
             check_identity(workload_report["runner"])
             counts = workload_report["counts"]
             for key in ("offered", "started", "completed", "passed", "complete_http_responses"):
-                assert counts[key] == 2, (key, counts)
+                assert counts[key] == 4, (key, counts)
             for key in ("failed", "cancelled", "unsent", "in_flight"):
                 assert counts[key] == 0, (key, counts)
-            assert workload_report["metrics"]["latency"]["samples"] == 2
+            assert workload_report["metrics"]["latency"]["samples"] == 4
             assert all(row["passed"] for row in workload_report["thresholds"])
             assert {row["request"] for row in workload_report["series"]} == {"allowedRead", "deniedRead"}
+            assert {row["phase"] for row in workload_report["series"]} == {"first", "second"}
             assert all(row["metrics"]["counts"]["passed"] == 1
                        for row in workload_report["series"])
             evidence = workload_report["evidence"]
-            assert evidence["complete"] is True and evidence["captured_records"] == 2
+            assert evidence["complete"] is True and evidence["captured_records"] == 4
             assert evidence["dropped_records"] == 0
             assert {record["status"] for record in evidence["records"]} == {200, 401}
-            assert len(requests) == before + 2
+            assert len(requests) == before + 4
             assert all(method == "GET" and path == workload_path
                        for method, path, _ in requests[before:])
             assert set(workload_headers) == {(workload_cookie, workload_csrf), (None, None)}, (
@@ -440,11 +472,88 @@ components:
             run(workload_arguments, expected=1, environment=workload_environment)
             assert len(requests) == before, "existing workload report must fail before traffic"
             assert (directory / "workload-report.json").read_bytes() == original
+
+            def workload_case(name, plan, expected=0, extra=(), environment=None):
+                filename = f"{name}.plan.json"
+                (directory / filename).write_text(json.dumps(plan))
+                arguments = ["workload", "run", filename, "--base-url", origin,
+                             "--execute", "--output", f"{name}.report.json"]
+                for operation in plan["requests"]:
+                    arguments.extend(["--operation", operation])
+                result = run([*arguments, *extra], expected, environment=environment)
+                document = json.loads((directory / f"{name}.report.json").read_text())
+                assert document["schema_version"] == 2 and document["kind"] == "workload"
+                assert document["passed"] == (expected == 0)
+                check_identity(document["runner"])
+                counts = document["counts"]
+                assert counts["offered"] == counts["started"] + counts["unsent"]
+                assert counts["started"] == counts["completed"] + counts["cancelled"]
+                assert counts["completed"] == counts["passed"] + counts["failed"]
+                assert counts["in_flight"] == 0
+                return result, document
+
+            write_key = "rusta-smoke-immutable-idempotency-secret"
+            write_body = b"immutable\x00rusta-smoke-body-secret\xff\n"
+            write_plan = {
+                "workload_version": 1, "actors": {"writer": {}},
+                "requests": {"write": {
+                    "method": "POST", "path": "/workload-write",
+                    "body_file": "runtime-body-secret.bin",
+                    "content_type": "application/octet-stream",
+                    "idempotency_key_env": "RUSTA_SMOKE_WRITE_KEY", "expect_status": 200,
+                }},
+                "groups": {"writes": {"actors": ["writer"], "max_in_flight": 1,
+                    "sequence": [{"request": "write"}, {"request": "write", "replay_of": 0}]}},
+                "phases": [{"name": "replay", "duration_ms": 100, "rates": {"writes": 1}}],
+                "max_in_flight": 1, "max_start_lag_ms": 500,
+                "timeout_ms": 2000, "drain_timeout_ms": 2000,
+            }
+            (directory / "write-preview.plan.json").write_text(json.dumps(write_plan))
+            before = len(requests)
+            preview = json.loads(run(["workload", "run", "write-preview.plan.json"]).stdout)
+            assert preview["requires_write_opt_in"] is True
+            assert preview["runtime_secrets_loaded"] is False
+            run(["workload", "run", "write-preview.plan.json", "--execute",
+                 "--base-url", origin, "--operation", "write"], expected=1)
+            assert len(requests) == before, "unapproved writes must fail before traffic"
+            (directory / "runtime-body-secret.bin").write_bytes(write_body)
+            result, replay = workload_case("workload-replay", write_plan,
+                extra=("--allow-writes",), environment={"RUSTA_SMOKE_WRITE_KEY": write_key})
+            assert replay["counts"]["offered"] == replay["counts"]["passed"] == 2
+            assert replay["sequence_counts"]["offered"] == replay["sequence_counts"]["passed"] == 1
+            assert workload_writes == [(write_body, write_key), (write_body, write_key)]
+            for secret in (write_key, "rusta-smoke-body-secret", "runtime-body-secret.bin",
+                           "RUSTA_SMOKE_WRITE_KEY", "/workload-write"):
+                assert secret not in json.dumps(replay)
+                assert secret not in result.stdout and secret not in result.stderr
+
+            failed_threshold = json.loads(json.dumps(workload))
+            failed_threshold["phases"] = [{"name": "threshold", "duration_ms": 100,
+                                           "rates": {"allowed": 1, "denied": 1}}]
+            # A zero maximum fails for every positive measured duration; this
+            # checks the exit contract without asserting a host speed target.
+            failed_threshold["thresholds"] = [{"metric": "max_ms", "maximum": 0}]
+            _, failed = workload_case("workload-threshold-failure", failed_threshold,
+                                      expected=1, environment=workload_environment)
+            assert failed["counts"]["failed"] == 0
+            assert failed["thresholds"][0]["reason"] == "maximum_exceeded"
+
+            bounded_capture = json.loads(json.dumps(failed_threshold))
+            bounded_capture["thresholds"] = [{"metric": "error_rate", "maximum": 0},
+                                             {"metric": "unsent_rate", "maximum": 0}]
+            bounded_capture["evidence"] = {"max_records": 1, "max_bytes": 4096}
+            _, bounded = workload_case("workload-capture-limit", bounded_capture,
+                                       environment=workload_environment)
+            assert bounded["counts"]["offered"] == bounded["counts"]["passed"] == 2
+            assert bounded["evidence"]["captured_records"] == 1
+            assert bounded["evidence"]["dropped_records"] == 1
+            assert bounded["evidence"]["complete"] is False
+            assert bounded["evidence"]["retention"] == "prefix_until_first_limit"
     finally:
         server.shutdown()
         server.server_close()
         worker.join(timeout=2)
-    print(f"Release smoke passed: {version}; GET, POST, duration, statuses, timeout, JSON accounting, OpenAPI JSON/YAML/URL generation, previews, authenticated GET/HEAD, schema failure, workload actors/expected denial/accounting, redaction and output preservation")
+    print(f"Release smoke passed: {version}; GET, POST, duration, statuses, timeout, JSON accounting, OpenAPI JSON/YAML/URL generation and byte limits, previews, authenticated GET/HEAD, reserved path data, partial-EOF cancellation, schema failure, workload actors/phases/denial/accounting, write opt-in/replay, thresholds/capture loss, redaction and output preservation")
 
 
 if __name__ == "__main__":

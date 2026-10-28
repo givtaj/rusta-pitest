@@ -991,7 +991,15 @@ mod tests {
                 std::process::id(),
                 COUNTER.fetch_add(1, Ordering::Relaxed)
             ));
-            std::fs::create_dir(&path).unwrap();
+            let mut directory = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                directory.mode(0o700);
+            }
+            // Atomic creation refuses an existing directory or symlink. Keep
+            // fixture files inaccessible to other users even under umask 000.
+            directory.create(&path).unwrap();
             Self(path)
         }
     }
@@ -1000,6 +1008,21 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixture_directory_has_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = TempDir::new();
+        assert_eq!(
+            std::fs::metadata(&directory.0)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
     }
 
     fn response(status: u16, body: &[u8]) -> Response {

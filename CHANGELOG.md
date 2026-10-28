@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-alpha.4 — 2026-10-28
 
 - Add reviewed workload JSON plans with runtime actor cookie/custom-header
   bindings, static secret snapshots, bounded binary/environment bodies,
@@ -16,9 +16,13 @@
   leaving semicolon/comma literal in the target path.
 - Cancel wizard prompts on incomplete lines ending at EOF, including whitespace
   or partial affirmative confirmation, without starting requests.
+- Preserve completed request outcomes when the final drain expires rather than
+  misclassifying already finished tasks as cancelled.
+- Harden temporary test-fixture creation with exclusive opens and private
+  permissions, preserving pre-existing files and refusing symlinks.
 
-See [workloads](docs/workloads.md). These changes are not in the published
-`v0.1.0-alpha.3` package.
+See [release notes](docs/releases/v0.1.0-alpha.4.md) and
+[workloads](docs/workloads.md) for supported scope and limitations.
 
 ## 0.1.0-alpha.3 — 2026-10-26
 

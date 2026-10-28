@@ -30,7 +30,7 @@ Command-line arguments and terminal output can also expose values to your local
 environment. Direct benchmark commands have no custom-header or session-cookie
 bindings. OpenAPI suites support runtime bearer/header API-key authentication.
 
-The unreleased authored workload runner additionally binds complete header
+The authored workload runner, introduced in alpha.4, binds complete header
 values, including cookies and CSRF headers, through environment-variable names.
 Actor credentials and bodies are immutable execution snapshots; the runner does
 not update cookies, acquire credentials, or renew authentication automatically.

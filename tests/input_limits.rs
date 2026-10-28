@@ -26,14 +26,31 @@ impl TempDir {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir(&path).unwrap();
+        let mut directory = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        directory.create(&path).unwrap();
         Self(path)
     }
 
     fn file(&self, name: &str, bytes: &[u8]) -> String {
+        self.new_file(name, bytes).unwrap()
+    }
+
+    fn new_file(&self, name: &str, bytes: &[u8]) -> std::io::Result<String> {
         let path = self.path(name);
-        fs::write(&path, bytes).unwrap();
-        path
+        let mut file = fs::OpenOptions::new();
+        file.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            file.mode(0o600);
+        }
+        file.open(&path)?.write_all(bytes)?;
+        Ok(path)
     }
 
     fn path(&self, name: &str) -> String {
@@ -44,6 +61,39 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn temporary_fixtures_refuse_existing_files_and_have_private_permissions() {
+    let directory = TempDir::new();
+    let original = b"preserved synthetic fixture";
+    let path = directory.file("existing.json", original);
+    assert_eq!(
+        directory
+            .new_file("existing.json", b"replacement")
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(fs::read(&path).unwrap(), original);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&directory.0).unwrap().permissions().mode() & 0o077,
+            0
+        );
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+        std::os::unix::fs::symlink(&path, directory.path("link.json")).unwrap();
+        assert_eq!(
+            directory
+                .new_file("link.json", b"replacement")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
     }
 }
 

@@ -7,18 +7,19 @@ neither service is required to use the runner.
 
 ## Install the alpha
 
-`v0.1.0-alpha.3` adds experimental OpenAPI contract suites. CLI options and the
+`v0.1.0-alpha.4` adds authenticated, fixed-arrival workloads alongside experimental
+OpenAPI contract suites. CLI options and the
 JSON report schema may change in later alpha versions. The supported binaries are
 Linux x86_64 (Ubuntu 24.04 or a compatible glibc environment) and macOS arm64.
 Other operating systems and architectures are not verified for this release.
 
 Download the archive for your platform and `SHA256SUMS` from the
-[GitHub release](https://github.com/givtaj/rusta-pitest/releases/tag/v0.1.0-alpha.3).
+[GitHub release](https://github.com/givtaj/rusta-pitest/releases/tag/v0.1.0-alpha.4).
 Verify the downloaded archive before extracting it:
 
 ```sh
 # macOS; on Linux, use sha256sum instead of shasum -a 256.
-shasum -a 256 rusta-pitest-v0.1.0-alpha.3-*.tar.gz
+shasum -a 256 rusta-pitest-v0.1.0-alpha.4-*.tar.gz
 ```
 
 Compare the complete digest and filename with the matching line in
@@ -32,7 +33,7 @@ toolchain:
 
 ```sh
 cargo install --locked --git https://github.com/givtaj/rusta-pitest.git \
-  --tag v0.1.0-alpha.3 rusta-pitest
+  --tag v0.1.0-alpha.4 rusta-pitest
 rusta-pitest --version
 ```
 
@@ -40,11 +41,11 @@ This alpha is distributed through GitHub; no crates.io publication is required.
 The repository development examples below use `cargo run --release -- ...`;
 after installation, use `rusta-pitest ...` with the same arguments.
 
-See the [release notes](docs/releases/v0.1.0-alpha.3.md),
+See the [release notes](docs/releases/v0.1.0-alpha.4.md),
 [release thresholds](docs/release-policy.md), and [changelog](CHANGELOG.md).
-The thresholds govern release quality; the published alpha does not provide
-configurable latency or throughput pass/fail limits. The development workload
-runner below adds per-run latency and failure thresholds.
+The release thresholds govern release quality. Authored workloads additionally
+provide per-run latency and failure thresholds; direct benchmarks and generated
+suites retain their existing pass/fail semantics.
 Release checks include `cargo-audit` 0.22.2 with `cargo audit --deny warnings`;
 known vulnerabilities and denied warnings block publication. Final validation
 and artifact evidence are recorded in the published GitHub release.
@@ -90,11 +91,10 @@ semantics remain visibly blocked. See [OpenAPI suites](docs/openapi-suites.md)
 for a [synthetic example](examples/widgets.openapi.yaml), execution, supported
 contracts, and coverage reports.
 
-## Authored workloads (development, unreleased)
+## Authored workloads
 
-The development branch adds `workload run`; this command is not included in
-the published `v0.1.0-alpha.3` package. Preview an authored plan without traffic
-or reading secret environment values:
+Introduced in `v0.1.0-alpha.4`, `workload run` previews an authored plan without
+traffic or reading secret environment values:
 
 ```sh
 cargo run --locked -- workload run examples/workload.json
@@ -110,7 +110,7 @@ automatic authentication renewal. Execution requires `--execute`, an explicit
 See [workloads](docs/workloads.md) for a runnable localhost fixture, the complete
 plan, credential handling, sequence semantics, limits, and schema-v2 reports.
 
-Development OpenAPI commands also accept bounded larger inputs:
+From alpha.4, OpenAPI commands also accept bounded larger inputs:
 `openapi generate --max-input-bytes` defaults to 1 MiB, its
 `--max-suite-bytes` defaults to 4 MiB, and `suite run --max-input-bytes`
 defaults to 4 MiB. Each accepts 1–67108864 bytes; structural bounds still apply.
@@ -357,14 +357,11 @@ GitHub Actions runs these checks on pushes and pull requests. Regression tests
 cover persistent HTTP connections, full-body failures, mixed outcomes, JSON
 artifacts, source provenance, and release notice generation.
 
-Implementation has eight modules: CLI arguments, the wizard, the target
-catalogue, the SleepAPI profile, its response contract, the request runner/report,
-JSON output, and the
-entry point. A small build script records compiler and source identity.
+A small build script records compiler and source identity.
 Source archives without their own Git metadata report unknown revision and
 source cleanliness (`null` in JSON), even inside an unrelated Git checkout.
 Official release binaries carry their tagged source revision and clean marker.
-The separate development workload runner supports authored plans and static
+The separate workload runner supports authored plans and static
 actor authentication. Automatic session renewal, target lifecycle management,
 warmup controls, and saved comparisons remain separate work.
 

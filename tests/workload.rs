@@ -24,7 +24,15 @@ impl Temp {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir(&path).unwrap();
+        let mut directory = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        // create is atomic and refuses pre-existing paths; private permissions
+        // protect intentional fixture rewrites inside this owned directory.
+        directory.create(&path).unwrap();
         Self(path)
     }
     fn plan(&self, value: &Value) -> PathBuf {
