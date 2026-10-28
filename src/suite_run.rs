@@ -16,11 +16,11 @@ use sha2::{Digest, Sha256};
 
 use crate::model::{Case, Suite};
 
-const MAX_SUITE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 pub struct RunOptions {
     pub suite: PathBuf,
+    pub max_input_bytes: u64,
     pub base_url: Option<Url>,
     pub execute: bool,
     pub operations: Vec<String>,
@@ -53,19 +53,22 @@ struct HeaderPlan {
 }
 
 pub async fn run(options: RunOptions) -> Result<Value, String> {
+    if !(1..=crate::strict_json::MAX_CONFIGURED_BYTES).contains(&options.max_input_bytes) {
+        return Err("suite input limit must be between 1 byte and 64 MiB".into());
+    }
     if options.timeout_ms == 0 || options.rate_per_second == 0 || options.max_requests == 0 {
         return Err("timeout, rate and request limit must be positive".into());
     }
     let mut bytes = Vec::new();
     File::open(&options.suite)
         .map_err(|_| "cannot open suite file")?
-        .take(MAX_SUITE_BYTES + 1)
+        .take(options.max_input_bytes + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| "cannot read suite file")?;
-    if bytes.len() as u64 > MAX_SUITE_BYTES {
-        return Err("suite exceeds the 4 MiB input limit".into());
+    if bytes.len() as u64 > options.max_input_bytes {
+        return Err("suite exceeds the configured input limit".into());
     }
-    let raw = crate::strict_json::parse_json_with_limit(&bytes, MAX_SUITE_BYTES as usize)?;
+    let raw = crate::strict_json::parse_json_with_limit(&bytes, options.max_input_bytes as usize)?;
     let suite: Suite = serde_json::from_value(raw).map_err(|_| "invalid suite structure")?;
     validate_suite(&suite)?;
     let digest = format!("{:x}", Sha256::digest(&bytes));
@@ -517,19 +520,25 @@ fn build_request(
     {
         return Err("parameter_serialization_unsupported".into());
     }
-    {
-        let mut segments = url
-            .path_segments_mut()
-            .map_err(|_| "base_url_path_unsupported")?;
-        segments.pop_if_empty();
-        for part in case.path[1..].split('/') {
-            let segment = render_segment(part, values)?;
-            if matches!(segment.as_str(), "." | "..") {
-                return Err("operation_path_unsupported".into());
-            }
-            segments.push(&segment);
-        }
+    if url.cannot_be_a_base() {
+        return Err("base_url_path_unsupported".into());
     }
+    let mut path = url
+        .path()
+        .strip_suffix('/')
+        .unwrap_or(url.path())
+        .to_owned();
+    for part in case.path[1..].split('/') {
+        let segment = render_segment(part, values)?;
+        if matches!(segment.as_str(), "." | "..") {
+            return Err("operation_path_unsupported".into());
+        }
+        path.push('/');
+        path.push_str(&segment);
+    }
+    // The rendered fixtures and base path are already encoded. The full-path
+    // setter preserves those escapes; a path-segment setter would encode '%' again.
+    url.set_path(&path);
     let mut query = Vec::new();
     for parameter in &case.parameters {
         let Some(value) = values.get(&(parameter.location.as_str(), parameter.name.as_str()))
@@ -603,7 +612,7 @@ fn build_request(
         .map_err(|_| "request_configuration_invalid".into())
 }
 
-/// Interpret contract tokens once; fixture text remains literal data.
+/// Interpret contract tokens once, encoding fixture data for simple expansion.
 fn render_segment(
     template: &str,
     values: &BTreeMap<(&str, &str), Value>,
@@ -623,7 +632,7 @@ fn render_segment(
             return Err("operation_path_unsupported".into());
         }
         let value = values.get(&("path", name)).ok_or("path_fixture_required")?;
-        rendered.push_str(&scalar(value)?);
+        rendered.push_str(&encode(&scalar(value)?));
         remainder = &token[end + 1..];
     }
     if remainder.contains('}') {
@@ -1040,6 +1049,37 @@ mod tests {
         for traversal in [".", ".."] {
             values.insert(("path", "id"), json!(traversal));
             assert!(build_request(&client, &base, &case(), &values, HeaderMap::new()).is_err());
+        }
+        let mut mixed = case();
+        mixed.path = "/widgets/.{id}".into();
+        values.insert(("path", "id"), json!("."));
+        assert!(build_request(&client, &base, &mixed, &values, HeaderMap::new()).is_err());
+    }
+
+    #[test]
+    fn simple_path_fixtures_encode_data_once_and_preserve_literal_paths() {
+        let client = Client::new();
+        let base = Url::parse("https://example.test/api/encoded%2Fprefix/").unwrap();
+        let mut case = case();
+        case.path = "/literal;part,part/prefix-{id}.json".into();
+        for (fixture, encoded) in [
+            ("a;b,c", "a%3Bb%2Cc"),
+            (":@&=+$!'()*[]", "%3A%40%26%3D%2B%24%21%27%28%29%2A%5B%5D"),
+            ("a/b?x#y", "a%2Fb%3Fx%23y"),
+            ("%2F%2e%2e", "%252F%252e%252e"),
+            ("\\evil.test", "%5Cevil.test"),
+            ("☃/{id}", "%E2%98%83%2F%7Bid%7D"),
+            ("AZaz09-._~", "AZaz09-._~"),
+        ] {
+            let values = BTreeMap::from([(("path", "id"), json!(fixture))]);
+            let request = build_request(&client, &base, &case, &values, HeaderMap::new()).unwrap();
+            assert_eq!(
+                request.url().as_str(),
+                format!(
+                    "https://example.test/api/encoded%2Fprefix/literal;part,part/prefix-{encoded}.json"
+                ),
+                "fixture must remain simple-style parameter data: {fixture:?}"
+            );
         }
     }
 

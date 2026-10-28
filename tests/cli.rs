@@ -666,19 +666,42 @@ fn wizard_cancellation_and_eof_at_confirmation_never_connect() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    for confirmation in ["n\n", "q\n", ""] {
-        let input = format!("3\n{url}\n\n\n\n{confirmation}");
-        let output = run_with_input(&["wizard"], &input);
-        assert_eq!(output.status.code(), Some(0), "{output:?}");
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("Cancelled."),
-            "cancellation needs an explanation: {output:?}"
-        );
-        assert_eq!(
-            listener.accept().unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock,
-            "unconfirmed wizard must not open a connection"
-        );
+    for (target, body) in [("3", ""), ("4", "\n")] {
+        for confirmation in ["n\n", "q\n", "", " ", "\t", "\r", "y", "yes", " y "] {
+            let input = format!("{target}\n{url}\n{body}\n100\n\n{confirmation}");
+            let output = run_with_input(&["wizard"], &input);
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("Cancelled."),
+                "cancellation needs an explanation: {output:?}"
+            );
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "unconfirmed wizard must not open a connection"
+            );
+        }
+    }
+}
+
+#[test]
+fn wizard_completed_blank_confirmation_accepts_defaults_for_lf_and_crlf() {
+    for newline in ["\n", "\r\n"] {
+        for target in ["3", "4", "5", "6"] {
+            let server = Server::start(|_, stream| respond(stream, "200 OK", b"{}"));
+            let input = match target {
+                "3" => format!("3\n{}\n\n\n\n\n", server.url),
+                "4" => format!("4\n{}\n\n\n\n\n\n", server.url),
+                "5" => format!("5\n1\n{}\n\n\n\n\n", server.url),
+                "6" => format!("6\n{}\nbaseline\n0\n\n1\n\n\n\n", server.url),
+                _ => unreachable!(),
+            }
+            .replace('\n', newline);
+            let output = run_with_input(&["wizard"], &input);
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("Cancelled."));
+            assert_eq!(server.finish().len(), if target == "6" { 4 } else { 1 });
+        }
     }
 }
 
@@ -923,8 +946,8 @@ fn wizard_catalogue_cancellation_and_eof_never_connect() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
-    for confirmation in ["n\n", "q\n", ""] {
-        let input = format!("5\nroots-session-signed-out\n{base_url}\n\n\n\n{confirmation}");
+    for confirmation in ["n\n", "q\n", "", " ", "\t", "\r", "y", "yes", " y "] {
+        let input = format!("5\nroots-session-signed-out\n{base_url}\n\n100\n\n{confirmation}");
         let output = run_with_input(&["wizard"], &input);
         assert_eq!(output.status.code(), Some(0), "{output:?}");
         assert!(
@@ -988,8 +1011,8 @@ fn wizard_sleepapi_cancellation_and_eof_never_connect() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
-    for confirmation in ["n\n", "q\n", ""] {
-        let input = format!("6\n{base_url}\nbaseline\n\n\n1\n\n\n{confirmation}");
+    for confirmation in ["n\n", "q\n", "", " ", "\t", "\r", "y", "yes", " y "] {
+        let input = format!("6\n{base_url}\nbaseline\n\n\n1\n100\n\n{confirmation}");
         let output = run_with_input(&["wizard"], &input);
         assert_eq!(output.status.code(), Some(0), "{output:?}");
         assert!(String::from_utf8_lossy(&output.stdout).contains("Cancelled."));

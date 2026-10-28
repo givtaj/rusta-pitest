@@ -42,8 +42,9 @@ after installation, use `rusta-pitest ...` with the same arguments.
 
 See the [release notes](docs/releases/v0.1.0-alpha.3.md),
 [release thresholds](docs/release-policy.md), and [changelog](CHANGELOG.md).
-The thresholds govern release quality; the CLI does not currently provide
-configurable latency or throughput pass/fail limits.
+The thresholds govern release quality; the published alpha does not provide
+configurable latency or throughput pass/fail limits. The development workload
+runner below adds per-run latency and failure thresholds.
 Release checks include `cargo-audit` 0.22.2 with `cargo audit --deny warnings`;
 known vulnerabilities and denied warnings block publication. Final validation
 and artifact evidence are recorded in the published GitHub release.
@@ -88,6 +89,32 @@ and bearer/header API-key credentials bound at runtime. Writes and unsupported
 semantics remain visibly blocked. See [OpenAPI suites](docs/openapi-suites.md)
 for a [synthetic example](examples/widgets.openapi.yaml), execution, supported
 contracts, and coverage reports.
+
+## Authored workloads (development, unreleased)
+
+The development branch adds `workload run`; this command is not included in
+the published `v0.1.0-alpha.3` package. Preview an authored plan without traffic
+or reading secret environment values:
+
+```sh
+cargo run --locked -- workload run examples/workload.json
+```
+
+The runner adds isolated actor cookie/custom-header bindings, fixed-arrival
+request mixes, measured phases, reserved group capacity, explicit request
+sequences and opted-in writes/replay. It records offered, started, completed,
+failed, cancelled and unsent requests, scoped thresholds, per-route latency,
+and bounded timing evidence. There is no request queue, automatic retry, or
+automatic authentication renewal. Execution requires `--execute`, an explicit
+`--base-url`, every referenced `--operation`, and `--allow-writes` for writes.
+See [workloads](docs/workloads.md) for a runnable localhost fixture, the complete
+plan, credential handling, sequence semantics, limits, and schema-v2 reports.
+
+Development OpenAPI commands also accept bounded larger inputs:
+`openapi generate --max-input-bytes` defaults to 1 MiB, its
+`--max-suite-bytes` defaults to 4 MiB, and `suite run --max-input-bytes`
+defaults to 4 MiB. Each accepts 1–67108864 bytes; structural bounds still apply.
+See [OpenAPI input limits](docs/openapi-suites.md#generate-and-review).
 
 ## Guided mode
 
@@ -337,8 +364,9 @@ entry point. A small build script records compiler and source identity.
 Source archives without their own Git metadata report unknown revision and
 source cleanliness (`null` in JSON), even inside an unrelated Git checkout.
 Official release binaries carry their tagged source revision and clean marker.
-Scenario files, authentication, warmup controls, and saved comparisons can be
-added individually when the first real use calls for them.
+The separate development workload runner supports authored plans and static
+actor authentication. Automatic session renewal, target lifecycle management,
+warmup controls, and saved comparisons remain separate work.
 
 Contributions and bug reports are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md)
 for the development workflow. Report suspected vulnerabilities through the

@@ -16,6 +16,7 @@ include = [
     "/src/**",
     "/tests/*.rs",
     "/examples/*.yaml",
+    "/examples/*.json",
     "/tests/test_build_provenance.py",
     "/tests/test_notices.py",
     "/scripts/release-smoke.py",
@@ -28,6 +29,7 @@ include = [
     "/CHANGELOG.md",
     "/docs/json-reports.md",
     "/docs/openapi-suites.md",
+    "/docs/workloads.md",
     "/docs/roots-catalogue.md",
     "/docs/sleepapi-profile.md",
     "/docs/release-policy.md",
@@ -44,4 +46,7 @@ serde_json = "1"
 sha2 = "0.10"
 yaml_serde = "0.10"
 jsonschema = { version = "0.60", default-features = false }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

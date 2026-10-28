@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- Add reviewed workload JSON plans with runtime actor cookie/custom-header
+  bindings, static secret snapshots, bounded binary/environment bodies,
+  positive and expected-denial checks, and optional JSON response schemas.
+- Add deterministic request mixes, fixed-arrival scheduling, phases, reserved
+  group capacity, bounded drain/cancellation, explicit setup outside measurement,
+  and explicit write/sequence/replay opt-in with immutable body/key reuse.
+- Add schema-v2 workload reports with lifecycle accounting, scoped latency/error
+  thresholds, per-request/group/phase metrics, and bounded correlation evidence.
+- Allow bounded OpenAPI contract/suite byte-limit overrides while preserving
+  parser/schema structural bounds and existing benchmark/suite semantics.
+- Encode simple-style path fixture reserved characters as data instead of
+  leaving semicolon/comma literal in the target path.
+- Cancel wizard prompts on incomplete lines ending at EOF, including whitespace
+  or partial affirmative confirmation, without starting requests.
+
+See [workloads](docs/workloads.md). These changes are not in the published
+`v0.1.0-alpha.3` package.
+
 ## 0.1.0-alpha.3 — 2026-10-26
 
 - Generate deterministic, reviewable suites from raw OpenAPI 3.1 JSON/YAML at

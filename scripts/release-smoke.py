@@ -32,9 +32,13 @@ def main():
     ).group(1)
     requests = []
     api_headers = []
+    workload_headers = []
     lock = threading.Lock()
     api_token = "rusta-smoke-auth-secret"
     fixture_id = "rusta-smoke-fixture-secret"
+    workload_cookie = "session=rusta-workload-cookie-secret"
+    workload_csrf = "rusta-workload-csrf-secret"
+    workload_path = "/workload-smoke/runtime-private-path"
     widget_response = {"200": {
         "description": "Synthetic widget",
         "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Widget"}}},
@@ -88,6 +92,17 @@ def main():
             status = 503 if self.path == "/failure" else 200
             if self.path == "/openapi.json":
                 payload = json.dumps(openapi_contract).encode()
+            elif self.path == workload_path:
+                cookie = self.headers.get("Cookie")
+                csrf = self.headers.get("X-CSRF-Token")
+                with lock:
+                    workload_headers.append((cookie, csrf))
+                authenticated = cookie == workload_cookie and csrf == workload_csrf
+                status = 200 if authenticated else 401
+                payload = json.dumps({
+                    "ok": authenticated, "denied": not authenticated,
+                    "private": "rusta-workload-response-secret",
+                }).encode()
             elif self.path.startswith("/api/v1/"):
                 authorization = self.headers.get("Authorization")
                 with lock:
@@ -325,11 +340,111 @@ components:
             assert (directory / "suite-get.json").read_bytes() == original
             assert not any(method == "POST" and path.startswith("/api/")
                            for method, path, _ in requests)
+
+            # Exercise the separate workload CLI from the packaged executable.
+            # One offered request per group keeps counts exact without a timing
+            # or service-capacity claim, while sharing the transport across actors.
+            workload = {
+                "workload_version": 1,
+                "actors": {
+                    "authenticated": {"headers_env": {
+                        "Cookie": "RUSTA_SMOKE_WORKLOAD_COOKIE",
+                        "X-CSRF-Token": "RUSTA_SMOKE_WORKLOAD_CSRF",
+                    }},
+                    "anonymous": {},
+                },
+                "requests": {
+                    "allowedRead": {
+                        "method": "GET", "path": workload_path, "expect_status": 200,
+                        "response_schema": {"type": "object", "required": ["ok"],
+                                            "properties": {"ok": {"const": True}}},
+                    },
+                    "deniedRead": {
+                        "method": "GET", "path": workload_path, "expect_status": 401,
+                        "response_schema": {"type": "object", "required": ["denied"],
+                                            "properties": {"denied": {"const": True}}},
+                    },
+                },
+                "groups": {
+                    "allowed": {"actors": ["authenticated"], "max_in_flight": 1,
+                                "requests": ["allowedRead"]},
+                    "denied": {"actors": ["anonymous"], "max_in_flight": 1,
+                               "requests": ["deniedRead"]},
+                },
+                "phases": [{"name": "smoke", "duration_ms": 500,
+                            "rates": {"allowed": 1, "denied": 1}}],
+                "max_in_flight": 2, "timeout_ms": 2000,
+                "drain_timeout_ms": 2000, "max_start_lag_ms": 500,
+                "thresholds": [{"metric": "error_rate", "maximum": 0},
+                               {"metric": "unsent_rate", "maximum": 0}],
+                "evidence": {"max_records": 4, "max_bytes": 4096},
+            }
+            (directory / "workload.json").write_text(json.dumps(workload))
+            workload_target = ["workload", "run", "workload.json", "--base-url", origin]
+            before = len(requests)
+            preview_result = run([*workload_target, "--output", "workload-preview.json"],
+                                 environment={"RUSTA_SMOKE_WORKLOAD_COOKIE": "",
+                                              "RUSTA_SMOKE_WORKLOAD_CSRF": ""})
+            preview = json.loads((directory / "workload-preview.json").read_text())
+            assert json.loads(preview_result.stdout) == preview
+            assert preview["schema_version"] == 2 and preview["kind"] == "workload"
+            assert preview["workload_version"] == 1 and preview["mode"] == "preview"
+            assert preview["executed"] is False and preview["passed"] is None
+            assert preview["runtime_secrets_loaded"] is False
+            assert preview["planned_requests"] == 2
+            check_identity(preview["runner"])
+            assert len(requests) == before, "workload preview must send no traffic"
+
+            workload_environment = {"RUSTA_SMOKE_WORKLOAD_COOKIE": workload_cookie,
+                                    "RUSTA_SMOKE_WORKLOAD_CSRF": workload_csrf}
+            workload_arguments = [*workload_target, "--operation", "allowedRead",
+                                  "--operation", "deniedRead", "--execute",
+                                  "--output", "workload-report.json"]
+            workload_result = run(workload_arguments, environment=workload_environment)
+            workload_report = json.loads((directory / "workload-report.json").read_text())
+            assert json.loads(workload_result.stdout) == workload_report
+            assert workload_report["schema_version"] == 2
+            assert workload_report["kind"] == "workload" and workload_report["workload_version"] == 1
+            assert workload_report["mode"] == "execute" and workload_report["executed"] is True
+            assert workload_report["passed"] is True
+            check_identity(workload_report["runner"])
+            counts = workload_report["counts"]
+            for key in ("offered", "started", "completed", "passed", "complete_http_responses"):
+                assert counts[key] == 2, (key, counts)
+            for key in ("failed", "cancelled", "unsent", "in_flight"):
+                assert counts[key] == 0, (key, counts)
+            assert workload_report["metrics"]["latency"]["samples"] == 2
+            assert all(row["passed"] for row in workload_report["thresholds"])
+            assert {row["request"] for row in workload_report["series"]} == {"allowedRead", "deniedRead"}
+            assert all(row["metrics"]["counts"]["passed"] == 1
+                       for row in workload_report["series"])
+            evidence = workload_report["evidence"]
+            assert evidence["complete"] is True and evidence["captured_records"] == 2
+            assert evidence["dropped_records"] == 0
+            assert {record["status"] for record in evidence["records"]} == {200, 401}
+            assert len(requests) == before + 2
+            assert all(method == "GET" and path == workload_path
+                       for method, path, _ in requests[before:])
+            assert set(workload_headers) == {(workload_cookie, workload_csrf), (None, None)}, (
+                "workload actors must retain separate runtime headers", workload_headers
+            )
+            for secret in (workload_cookie, workload_csrf, workload_path, origin,
+                           "RUSTA_SMOKE_WORKLOAD_COOKIE", "RUSTA_SMOKE_WORKLOAD_CSRF",
+                           "rusta-workload-response-secret"):
+                for document in (preview, workload_report):
+                    assert secret not in json.dumps(document), "workload report disclosed runtime data"
+                for result in (preview_result, workload_result):
+                    assert secret not in result.stdout and secret not in result.stderr
+            original = (directory / "workload-report.json").read_bytes()
+            before = len(requests)
+            run(workload_arguments, expected=1, environment=workload_environment)
+            assert len(requests) == before, "existing workload report must fail before traffic"
+            assert (directory / "workload-report.json").read_bytes() == original
     finally:
         server.shutdown()
         server.server_close()
         worker.join(timeout=2)
-    print(f"Release smoke passed: {version}; GET, POST, duration, statuses, timeout, JSON accounting, OpenAPI JSON/YAML/URL generation, previews, authenticated GET/HEAD, schema failure, redaction and output preservation")
+    print(f"Release smoke passed: {version}; GET, POST, duration, statuses, timeout, JSON accounting, OpenAPI JSON/YAML/URL generation, previews, authenticated GET/HEAD, schema failure, workload actors/expected denial/accounting, redaction and output preservation")
 
 
 if __name__ == "__main__":

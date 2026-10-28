@@ -10,6 +10,8 @@ mod schema;
 mod strict_json;
 mod suite_run;
 mod wizard;
+mod workload;
+mod workload_http;
 
 use std::{path::Path, process::ExitCode};
 
@@ -36,14 +38,25 @@ async fn main() -> ExitCode {
     let destination = cli.output.as_deref();
     let (method, options, json) = match cli.command {
         Some(Command::Openapi {
-            command: cli::OpenApiCommand::Generate { source, out },
+            command:
+                cli::OpenApiCommand::Generate {
+                    source,
+                    out,
+                    max_input_bytes,
+                    max_suite_bytes,
+                },
         }) => {
-            return generate_suite(&source, &out).await;
+            return generate_suite(&source, &out, max_input_bytes, max_suite_bytes).await;
         }
         Some(Command::Suite {
             command: cli::SuiteCommand::Run(options),
         }) => {
             return run_suite(options, destination).await;
+        }
+        Some(Command::Workload {
+            command: cli::WorkloadCommand::Run(options),
+        }) => {
+            return run_workload(options, destination).await;
         }
         Some(Command::Catalogue) => {
             catalogue::print();
@@ -105,7 +118,12 @@ async fn main() -> ExitCode {
     )
 }
 
-async fn generate_suite(source: &str, out: &Path) -> ExitCode {
+async fn generate_suite(
+    source: &str,
+    out: &Path,
+    max_input_bytes: u64,
+    max_suite_bytes: u64,
+) -> ExitCode {
     let file = match output::ReportFile::prepare(out) {
         Ok(file) => file,
         Err(_) => {
@@ -113,11 +131,14 @@ async fn generate_suite(source: &str, out: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match openapi::generate(source).await {
+    match openapi::generate(source, max_input_bytes).await {
         Ok(suite) => {
             let value = serde_json::to_value(&suite).expect("suite is serializable");
             let bytes = serde_json::to_vec_pretty(&value).expect("suite is serializable");
-            if strict_json::parse_json_with_limit(&bytes, 4 * 1024 * 1024 - 1).is_err() {
+            // finish_value appends a final newline; it counts toward the output limit.
+            if bytes.len() as u64 >= max_suite_bytes
+                || strict_json::parse_json_with_limit(&bytes, max_suite_bytes as usize).is_err()
+            {
                 eprintln!("Generated suite exceeds the supported size or complexity limits");
                 return ExitCode::FAILURE;
             }
@@ -158,6 +179,7 @@ async fn run_suite(options: cli::SuiteOptions, destination: Option<&Path>) -> Ex
     };
     let result = suite_run::run(suite_run::RunOptions {
         suite: options.suite,
+        max_input_bytes: options.max_input_bytes,
         base_url: options.base_url,
         execute: options.execute,
         operations: options.operations,
@@ -202,6 +224,45 @@ fn prepare_report(destination: Option<&Path>) -> Result<Option<output::ReportFil
             eprintln!("Cannot prepare JSON report: {error}");
             ExitCode::FAILURE
         })
+}
+
+async fn run_workload(options: cli::WorkloadOptions, destination: Option<&Path>) -> ExitCode {
+    let file = match prepare_report(destination) {
+        Ok(file) => file,
+        Err(code) => return code,
+    };
+    match workload::run(workload::Options {
+        plan: options.plan,
+        execute: options.execute,
+        base_url: options.base_url,
+        operations: options.operations,
+        allow_writes: options.allow_writes,
+    })
+    .await
+    {
+        Ok(report) => {
+            let passed = report["passed"].as_bool().unwrap_or(!options.execute);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).expect("workload report is JSON")
+            );
+            if let Some(file) = file
+                && file.finish_value(&report).is_err()
+            {
+                eprintln!("Cannot publish workload report");
+                return ExitCode::FAILURE;
+            }
+            if passed {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(error) => {
+            eprintln!("Workload preflight failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn finish(document: output::Document, file: Option<output::ReportFile>) -> ExitCode {
