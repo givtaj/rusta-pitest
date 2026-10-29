@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Bound decoded string and object-key bytes during JSON/YAML parsing, including
+  YAML alias expansion, using the configured input budget.
+- Reject schemas whose expanded reference traversal exceeds the supported
+  complexity budget before compilation or request execution, while retaining
+  productive recursion and reference sibling constraints.
+
 ## 0.1.0-alpha.4 — 2026-10-28
 
 - Add reviewed workload JSON plans with runtime actor cookie/custom-header

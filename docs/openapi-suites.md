@@ -46,6 +46,12 @@ From alpha.4, explicit byte-limit options are available:
 | `openapi generate --max-suite-bytes` | 4194304 (4 MiB) | 1–67108864 bytes |
 | `suite run --max-input-bytes` | 4194304 (4 MiB) | 1–67108864 bytes |
 
+The input budget also caps the cumulative decoded UTF-8 bytes in string values
+and object keys. Each occurrence of a YAML alias counts toward this budget before
+the parser copies its text. Small aliases remain supported; documents whose
+decoded strings and keys exceed the configured budget are rejected before a
+suite is published. This budget does not describe total process memory.
+
 These are byte budgets, not disabled validation. Structural limits are unchanged:
 256 operations, 128 parameters per list, bounded nodes/nesting, local references,
 and the supported serializer/schema subset still apply. A larger generated suite
@@ -142,6 +148,12 @@ Custom dialects, `$id`, anchors, dynamic references, and non-descending referenc
 cycles block the case. Schema regular expressions use a bounded, linear-time
 engine; unsupported expressions block schema compilation. `format`, `readOnly`,
 `writeOnly`, and content annotations are not additional validation assertions.
+Before compilation, a schema is also checked against a 10,000-visit expanded
+reference budget and a depth limit of 64. Repeated references count on every
+path; productive recursive back-edges stop expansion while their sibling
+constraints are still checked. Over-budget schemas block the case. This is a
+schema admission limit, not a wall-clock or total-memory limit on validation;
+keyword costs and response size still affect validation work.
 Fixture synthesis is deliberately narrower than response validation and may
 leave a case blocked when it cannot construct a valid candidate.
 

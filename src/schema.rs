@@ -7,6 +7,7 @@ use serde_json::{Map, Value, json};
 
 const MAX_DEPTH: usize = 64;
 const MAX_RESOURCES: usize = 256;
+const MAX_SCHEMA_NODES: usize = 10_000;
 
 struct NoRetrieval;
 
@@ -30,6 +31,12 @@ pub fn compile(contract: &Value, schema: &Value) -> Result<Validator, String> {
         nodes: 0,
     };
     let normalized = graph.schema(schema, 0, 0)?;
+    ExpandedSchemaBudget {
+        definitions: &graph.definitions,
+        active: BTreeSet::new(),
+        nodes: 0,
+    }
+    .check(&normalized, 0)?;
     let document = json!({"$defs": graph.definitions, "allOf": [normalized]});
     jsonschema::options()
         .with_draft(Draft::Draft202012)
@@ -66,7 +73,7 @@ impl Graph<'_> {
         instance_depth: usize,
     ) -> Result<Value, String> {
         self.nodes += 1;
-        if depth > MAX_DEPTH || self.nodes > 10_000 {
+        if depth > MAX_DEPTH || self.nodes > MAX_SCHEMA_NODES {
             return Err("schema exceeds supported complexity limits".into());
         }
         if schema.is_boolean() {
@@ -126,11 +133,19 @@ impl Graph<'_> {
             "$defs",
             "definitions",
             "dependentSchemas",
+            "dependencies",
         ] {
             if let Some(value) = object.get(key) {
                 let values = value.as_object().ok_or("invalid schema map")?;
                 let mut result = Map::new();
                 for (name, child) in values {
+                    // The validator also honors this legacy keyword in the
+                    // selected draft. Arrays are property-name lists; other
+                    // values are schemas applied to the same instance.
+                    if key == "dependencies" && child.is_array() {
+                        result.insert(name.clone(), child.clone());
+                        continue;
+                    }
                     let descending = matches!(key, "properties" | "patternProperties");
                     result.insert(
                         name.clone(),
@@ -187,6 +202,91 @@ impl Graph<'_> {
         }
         // The original keyword values and $ref siblings are otherwise retained.
         Ok(Value::Object(normalized))
+    }
+}
+
+/// Charge repeated references for the schema work they can repeat at evaluation.
+/// Normalization shares reference targets, so its node count alone does not bound
+/// their expansion. This walk stops only at an active reference edge; productive
+/// recursion has already been checked by `Graph` and remains supported. This is
+/// an admission limit, not a time or memory budget for validating an instance.
+struct ExpandedSchemaBudget<'a> {
+    definitions: &'a Map<String, Value>,
+    active: BTreeSet<&'a str>,
+    nodes: usize,
+}
+
+impl<'a> ExpandedSchemaBudget<'a> {
+    fn check(&mut self, schema: &'a Value, depth: usize) -> Result<(), String> {
+        self.nodes += 1;
+        if depth > MAX_DEPTH || self.nodes > MAX_SCHEMA_NODES {
+            return Err("schema exceeds supported expanded complexity limits".into());
+        }
+        if schema.is_boolean() {
+            return Ok(());
+        }
+        let object = schema
+            .as_object()
+            .ok_or("expected a schema object or boolean")?;
+        if let Some(reference) = object.get("$ref") {
+            // Every schema reference was normalized to this private namespace.
+            let reference = reference.as_str().ok_or("invalid schema reference")?;
+            let name = reference
+                .strip_prefix("#/$defs/")
+                .ok_or("invalid normalized schema reference")?;
+            let target = self
+                .definitions
+                .get(name)
+                .ok_or("unresolved normalized schema reference")?;
+            if self.active.insert(reference) {
+                let result = self.check(target, depth + 1);
+                self.active.remove(reference);
+                result?;
+            }
+            // A recursive edge skips only its target, never its siblings below.
+        }
+        // Declarations in $defs/definitions are reached through references only.
+        // Literal values (const, enum, default, examples) are not schema children.
+        for key in [
+            "properties",
+            "patternProperties",
+            "dependentSchemas",
+            "dependencies",
+        ] {
+            if let Some(value) = object.get(key) {
+                for child in value.as_object().ok_or("invalid schema map")?.values() {
+                    if key == "dependencies" && child.is_array() {
+                        continue;
+                    }
+                    self.check(child, depth + 1)?;
+                }
+            }
+        }
+        for key in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+            if let Some(value) = object.get(key) {
+                for child in value.as_array().ok_or("invalid schema array")? {
+                    self.check(child, depth + 1)?;
+                }
+            }
+        }
+        for key in [
+            "additionalProperties",
+            "unevaluatedProperties",
+            "propertyNames",
+            "contains",
+            "items",
+            "unevaluatedItems",
+            "not",
+            "if",
+            "then",
+            "else",
+            "contentSchema",
+        ] {
+            if let Some(child) = object.get(key) {
+                self.check(child, depth + 1)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -291,6 +391,156 @@ fn reference_target<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shared_reference_chain(levels: usize) -> (Value, Value) {
+        let mut schemas = Map::new();
+        schemas.insert("L0".into(), json!({"type":"string", "minLength":1}));
+        for level in 1..=levels {
+            let reference = format!("#/components/schemas/L{}", level - 1);
+            schemas.insert(
+                format!("L{level}"),
+                json!({"allOf":[{"$ref":reference}, {"$ref":reference}]}),
+            );
+        }
+        (
+            json!({"components":{"schemas":schemas}}),
+            json!({"$ref":format!("#/components/schemas/L{levels}")}),
+        )
+    }
+
+    #[test]
+    fn repeated_reference_expansion_is_bounded_before_validation() {
+        let (small_contract, small_schema) = shared_reference_chain(4);
+        let validator = compile(&small_contract, &small_schema).unwrap();
+        assert!(validator.is_valid(&json!("ok")));
+        assert!(!validator.is_valid(&json!("")));
+        assert!(!validator.is_valid(&json!(42)));
+
+        // Only 13 distinct targets, but their repeated scalar checks would
+        // exceed the expanded-node limit. Rejection needs no costly evaluation.
+        let (large_contract, large_schema) = shared_reference_chain(12);
+        assert_eq!(
+            compile(&large_contract, &large_schema).err().as_deref(),
+            Some("schema exceeds supported expanded complexity limits")
+        );
+    }
+
+    #[test]
+    fn previously_normalized_targets_still_obey_expanded_depth_limit() {
+        let mut schemas = Map::new();
+        schemas.insert("L0".into(), json!({"type":"string"}));
+        let mut roots = vec![json!({"$ref":"#/components/schemas/L0"})];
+        for level in 1..=70 {
+            schemas.insert(
+                format!("L{level}"),
+                json!({"$ref":format!("#/components/schemas/L{}", level - 1)}),
+            );
+            roots.push(json!({"$ref":format!("#/components/schemas/L{level}")}));
+        }
+        let contract = json!({"components":{"schemas":schemas}});
+        // Short targets appear first, so normalization can reuse them without
+        // traversing the full chain. The expansion check must walk it again.
+        assert_eq!(
+            compile(&contract, &json!({"allOf":roots})).err().as_deref(),
+            Some("schema exceeds supported expanded complexity limits")
+        );
+    }
+
+    #[test]
+    fn productive_mutual_recursion_preserves_reference_siblings() {
+        let contract = json!({"components":{"schemas":{
+            "A":{"type":"object", "properties":{"next":{"$ref":"#/components/schemas/B"}}},
+            "B":{"type":"object", "properties":{"next":{
+                "$ref":"#/components/schemas/A", "required":["value"]
+            }}}
+        }}});
+        let validator = compile(&contract, &json!({"$ref":"#/components/schemas/A"})).unwrap();
+        assert!(validator.is_valid(&json!({"next":{"next":{"value":1}}})));
+        assert!(!validator.is_valid(&json!({"next":{"next":{}}})));
+        assert!(!validator.is_valid(&json!({"next":{"next":4}})));
+    }
+
+    #[test]
+    fn active_recursive_reference_does_not_skip_expensive_siblings() {
+        let (mut contract, shared_schema) = shared_reference_chain(12);
+        contract["components"]["schemas"]["Node"] = json!({
+            "type":"object",
+            "properties":{"next":{
+                "$ref":"#/components/schemas/Node",
+                "allOf":[shared_schema]
+            }}
+        });
+        assert_eq!(
+            compile(&contract, &json!({"$ref":"#/components/schemas/Node"}))
+                .err()
+                .as_deref(),
+            Some("schema exceeds supported expanded complexity limits")
+        );
+    }
+
+    #[test]
+    fn unused_schema_declarations_are_not_expanded() {
+        let (contract, shared_schema) = shared_reference_chain(12);
+        let schema = json!({"type":"string", "$defs":{"unused":shared_schema}});
+        let validator = compile(&contract, &schema).unwrap();
+        assert!(validator.is_valid(&json!("ok")));
+        assert!(!validator.is_valid(&json!(42)));
+    }
+
+    #[test]
+    fn legacy_dependencies_preserve_schema_boolean_and_property_list_semantics() {
+        let contract = json!({"components":{"schemas":{
+            "Age":{"properties":{"age":{"type":"integer"}}, "required":["age"]}
+        }}});
+        let schema = json!({"type":"object", "dependencies":{
+            "name":{"$ref":"#/components/schemas/Age"},
+            "enabled":false,
+            "free":true,
+            "left":["right"]
+        }});
+        let validator = compile(&contract, &schema).unwrap();
+        assert!(validator.is_valid(&json!({})));
+        assert!(validator.is_valid(&json!({"free":1})));
+        assert!(!validator.is_valid(&json!({"enabled":true})));
+        assert!(validator.is_valid(&json!({"name":"n", "age":5})));
+        assert!(!validator.is_valid(&json!({"name":"n"})));
+        assert!(!validator.is_valid(&json!({"name":"n", "age":"five"})));
+        assert!(validator.is_valid(&json!({"left":1, "right":2})));
+        assert!(!validator.is_valid(&json!({"left":1})));
+    }
+
+    #[test]
+    fn legacy_dependencies_cannot_bypass_expanded_reference_limits() {
+        let (mut contract, shared_schema) = shared_reference_chain(12);
+        contract["components"]["schemas"]["L0"] = json!({"type":"object"});
+        let schema = json!({"dependencies":{"enabled":shared_schema}});
+        assert_eq!(
+            compile(&contract, &schema).err().as_deref(),
+            Some("schema exceeds supported expanded complexity limits")
+        );
+    }
+
+    #[test]
+    fn legacy_dependencies_cannot_bypass_reference_restrictions() {
+        assert_eq!(
+            compile(
+                &json!({}),
+                &json!({"dependencies":{"enabled":{"$ref":"https://example.test/schema"}}})
+            )
+            .err()
+            .as_deref(),
+            Some("external references are not supported")
+        );
+        let contract = json!({"components":{"schemas":{
+            "Loop":{"dependencies":{"enabled":{"$ref":"#/components/schemas/Loop"}}}
+        }}});
+        assert_eq!(
+            compile(&contract, &json!({"$ref":"#/components/schemas/Loop"}))
+                .err()
+                .as_deref(),
+            Some("recursive schema must descend into an instance property or item")
+        );
+    }
 
     #[test]
     fn reference_siblings_and_nested_constraints_are_preserved() {
