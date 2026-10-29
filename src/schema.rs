@@ -33,10 +33,10 @@ pub fn compile(contract: &Value, schema: &Value) -> Result<Validator, String> {
     let normalized = graph.schema(schema, 0, 0)?;
     ExpandedSchemaBudget {
         definitions: &graph.definitions,
-        active: BTreeSet::new(),
+        active: BTreeMap::new(),
         nodes: 0,
     }
-    .check(&normalized, 0)?;
+    .check(&normalized, 0, 0)?;
     let document = json!({"$defs": graph.definitions, "allOf": [normalized]});
     jsonschema::options()
         .with_draft(Draft::Draft202012)
@@ -207,17 +207,23 @@ impl Graph<'_> {
 
 /// Charge repeated references for the schema work they can repeat at evaluation.
 /// Normalization shares reference targets, so its node count alone does not bound
-/// their expansion. This walk stops only at an active reference edge; productive
-/// recursion has already been checked by `Graph` and remains supported. This is
-/// an admission limit, not a time or memory budget for validating an instance.
+/// their expansion. Recheck instance descent on every expanded recursive path:
+/// normalization may have cached a target through a different, productive path.
+/// Productive active reference edges stop expansion, but their siblings remain
+/// checked. This is an admission limit, not an instance time or memory budget.
 struct ExpandedSchemaBudget<'a> {
     definitions: &'a Map<String, Value>,
-    active: BTreeSet<&'a str>,
+    active: BTreeMap<&'a str, usize>,
     nodes: usize,
 }
 
 impl<'a> ExpandedSchemaBudget<'a> {
-    fn check(&mut self, schema: &'a Value, depth: usize) -> Result<(), String> {
+    fn check(
+        &mut self,
+        schema: &'a Value,
+        depth: usize,
+        instance_depth: usize,
+    ) -> Result<(), String> {
         self.nodes += 1;
         if depth > MAX_DEPTH || self.nodes > MAX_SCHEMA_NODES {
             return Err("schema exceeds supported expanded complexity limits".into());
@@ -238,8 +244,15 @@ impl<'a> ExpandedSchemaBudget<'a> {
                 .definitions
                 .get(name)
                 .ok_or("unresolved normalized schema reference")?;
-            if self.active.insert(reference) {
-                let result = self.check(target, depth + 1);
+            if let Some(active_depth) = self.active.get(reference) {
+                if instance_depth <= *active_depth {
+                    return Err(
+                        "recursive schema must descend into an instance property or item".into(),
+                    );
+                }
+            } else {
+                self.active.insert(reference, instance_depth);
+                let result = self.check(target, depth + 1, instance_depth);
                 self.active.remove(reference);
                 result?;
             }
@@ -258,14 +271,19 @@ impl<'a> ExpandedSchemaBudget<'a> {
                     if key == "dependencies" && child.is_array() {
                         continue;
                     }
-                    self.check(child, depth + 1)?;
+                    let descending = matches!(key, "properties" | "patternProperties");
+                    self.check(child, depth + 1, instance_depth + usize::from(descending))?;
                 }
             }
         }
         for key in ["allOf", "anyOf", "oneOf", "prefixItems"] {
             if let Some(value) = object.get(key) {
                 for child in value.as_array().ok_or("invalid schema array")? {
-                    self.check(child, depth + 1)?;
+                    self.check(
+                        child,
+                        depth + 1,
+                        instance_depth + usize::from(key == "prefixItems"),
+                    )?;
                 }
             }
         }
@@ -283,7 +301,16 @@ impl<'a> ExpandedSchemaBudget<'a> {
             "contentSchema",
         ] {
             if let Some(child) = object.get(key) {
-                self.check(child, depth + 1)?;
+                let descending = matches!(
+                    key,
+                    "additionalProperties"
+                        | "unevaluatedProperties"
+                        | "propertyNames"
+                        | "contains"
+                        | "items"
+                        | "unevaluatedItems"
+                );
+                self.check(child, depth + 1, instance_depth + usize::from(descending))?;
             }
         }
         Ok(())
@@ -458,6 +485,36 @@ mod tests {
         assert!(validator.is_valid(&json!({"next":{"next":{"value":1}}})));
         assert!(!validator.is_valid(&json!({"next":{"next":{}}})));
         assert!(!validator.is_valid(&json!({"next":{"next":4}})));
+    }
+
+    #[test]
+    fn cached_references_must_descend_on_every_recursive_path() {
+        let contract = json!({"components":{"schemas":{
+            "A":{"type":"object", "properties":{"next":{"$ref":"#/components/schemas/B"}}},
+            "B":{"$ref":"#/components/schemas/A"}
+        }}});
+        let root = json!({"$ref":"#/components/schemas/A"});
+        let validator = compile(&contract, &root).unwrap();
+        assert!(validator.is_valid(&json!({"next":{"next":{}}})));
+        assert!(!validator.is_valid(&json!({"next":4})));
+
+        // Normalization first caches B through properties.next. Each added
+        // same-instance path must still reject A -> B -> A when B is reused.
+        let reference = json!({"$ref":"#/components/schemas/B"});
+        for (keyword, child) in [
+            ("allOf", json!([reference])),
+            ("dependentSchemas", json!({"next":reference})),
+            ("dependencies", json!({"next":reference})),
+            ("not", reference),
+        ] {
+            let mut cyclic = contract.clone();
+            cyclic["components"]["schemas"]["A"][keyword] = child;
+            assert_eq!(
+                compile(&cyclic, &root).err().as_deref(),
+                Some("recursive schema must descend into an instance property or item"),
+                "cached path through {keyword}"
+            );
+        }
     }
 
     #[test]
