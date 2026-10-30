@@ -7,19 +7,19 @@ neither service is required to use the runner.
 
 ## Install the alpha
 
-`v0.1.0-alpha.4` adds authenticated, fixed-arrival workloads alongside experimental
-OpenAPI contract suites. CLI options and the
+`v0.1.0-alpha.5` bounds decoded JSON/YAML input and expanded schema references
+for OpenAPI suites and authenticated, fixed-arrival workloads. CLI options and the
 JSON report schema may change in later alpha versions. The supported binaries are
 Linux x86_64 (Ubuntu 24.04 or a compatible glibc environment) and macOS arm64.
 Other operating systems and architectures are not verified for this release.
 
 Download the archive for your platform and `SHA256SUMS` from the
-[GitHub release](https://github.com/givtaj/rusta-pitest/releases/tag/v0.1.0-alpha.4).
+[GitHub release](https://github.com/givtaj/rusta-pitest/releases/tag/v0.1.0-alpha.5).
 Verify the downloaded archive before extracting it:
 
 ```sh
 # macOS; on Linux, use sha256sum instead of shasum -a 256.
-shasum -a 256 rusta-pitest-v0.1.0-alpha.4-*.tar.gz
+shasum -a 256 rusta-pitest-v0.1.0-alpha.5-*.tar.gz
 ```
 
 Compare the complete digest and filename with the matching line in
@@ -33,7 +33,7 @@ toolchain:
 
 ```sh
 cargo install --locked --git https://github.com/givtaj/rusta-pitest.git \
-  --tag v0.1.0-alpha.4 rusta-pitest
+  --tag v0.1.0-alpha.5 rusta-pitest
 rusta-pitest --version
 ```
 
@@ -41,7 +41,7 @@ This alpha is distributed through GitHub; no crates.io publication is required.
 The repository development examples below use `cargo run --release -- ...`;
 after installation, use `rusta-pitest ...` with the same arguments.
 
-See the [release notes](docs/releases/v0.1.0-alpha.4.md),
+See the [release notes](docs/releases/v0.1.0-alpha.5.md),
 [release thresholds](docs/release-policy.md), and [changelog](CHANGELOG.md).
 The release thresholds govern release quality. Authored workloads additionally
 provide per-run latency and failure thresholds; direct benchmarks and generated

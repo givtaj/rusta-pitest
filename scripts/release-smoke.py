@@ -300,6 +300,56 @@ components:
             run(["suite", "run", "budget-suite.json", "--max-input-bytes", "16777216"])
             assert len(requests) == before, "local byte-budget checks must send no traffic"
 
+            # Keep the encoded fixture small while making decoded alias bytes
+            # exceed its configured budget. The rejection must precede output.
+            alias_marker = "rusta-smoke-decoded-value" * 32
+            alias_source = ((directory / "contract.yaml").read_text()
+                            + f"x-value: &value '{alias_marker}'\nx-copies:\n"
+                            + "  - *value\n" * 16)
+            (directory / "aliases.yaml").write_text(alias_source)
+            rejected = run(["openapi", "generate", "aliases.yaml",
+                            "--out", "aliases-rejected.json", "--max-input-bytes",
+                            str(len(alias_source.encode()))], expected=1)
+            assert "decoded string and key byte limit" in rejected.stderr
+            assert "rusta-smoke-decoded-value" not in rejected.stdout + rejected.stderr
+            assert not (directory / "aliases-rejected.json").exists()
+            run(["openapi", "generate", "aliases.yaml", "--out", "aliases-accepted.json",
+                 "--max-input-bytes", "32768"])
+            aliases = json.loads((directory / "aliases-accepted.json").read_text())
+            assert aliases["contract"]["x-copies"] == [alias_marker] * 16
+            run(["suite", "run", "aliases-accepted.json"])
+            assert len(requests) == before, "decoded-budget checks must send no traffic"
+
+            def expanded_definitions(prefix, keyword="allOf"):
+                definitions = {"n0": {"type": "object"}}
+                for level in range(1, 13):
+                    reference = {"$ref": f"{prefix}/n{level - 1}"}
+                    children = ([reference, reference] if keyword == "allOf"
+                                else {"left": reference, "right": reference})
+                    definitions[f"n{level}"] = {keyword: children}
+                return definitions
+
+            # A compact shared-reference graph must become a visible blocker,
+            # and execution must refuse it before making an API request.
+            expanded_contract = {
+                "openapi": "3.1.0", "info": {"title": "Schema budget smoke", "version": "1"},
+                "paths": {"/must-not-run": {"get": {
+                    "operationId": "expandedSchema", "responses": {"200": {
+                        "description": "Synthetic object", "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/n12"},
+                        }},
+                    }},
+                }}},
+                "components": {"schemas": expanded_definitions("#/components/schemas")},
+            }
+            (directory / "expanded-contract.json").write_text(json.dumps(expanded_contract))
+            run(["openapi", "generate", "expanded-contract.json", "--out", "expanded-suite.json"])
+            expanded_suite = json.loads((directory / "expanded-suite.json").read_text())
+            assert any("schema" in reason for reason in expanded_suite["cases"][0]["blockers"])
+            run(["suite", "run", "expanded-suite.json", "--base-url", origin,
+                 "--operation", "expandedSchema", "--execute"], expected=1)
+            assert len(requests) == before, "expanded OpenAPI schemas must fail before traffic"
+
             run(["openapi", "generate", f"{origin}/openapi.json", "--out", "url-suite.json"])
             assert len(requests) == before + 1
             assert requests[-1][:2] == ("GET", "/openapi.json")
@@ -428,6 +478,40 @@ components:
 
             workload_environment = {"RUSTA_SMOKE_WORKLOAD_COOKIE": workload_cookie,
                                     "RUSTA_SMOKE_WORKLOAD_CSRF": workload_csrf}
+
+            # Check expanded references and cached nonproductive cycles through
+            # preview and execution, with setup present to catch early traffic.
+            unsupported_schemas = {
+                keyword: {"$defs": expanded_definitions("#/$defs", keyword),
+                          "$ref": "#/$defs/n12"}
+                for keyword in ("allOf", "dependencies")
+            }
+            unsupported_schemas["cached-cycle"] = {
+                "$defs": {
+                    "A": {"properties": {"next": {"$ref": "#/$defs/B"}},
+                          "allOf": [{"$ref": "#/$defs/B"}]},
+                    "B": {"$ref": "#/$defs/A"},
+                },
+                "$ref": "#/$defs/A",
+            }
+            for name, schema in unsupported_schemas.items():
+                expanded_workload = json.loads(json.dumps(workload))
+                expanded_workload["requests"]["deniedRead"]["response_schema"] = schema
+                expanded_workload["setup"] = [{"actor": "anonymous", "request": "deniedRead"}]
+                filename = f"unsupported-{name}.plan.json"
+                (directory / filename).write_text(json.dumps(expanded_workload))
+                for execute in (False, True):
+                    output = f"unsupported-{name}-{execute}.report.json"
+                    arguments = ["workload", "run", filename, "--base-url", origin,
+                                 "--operation", "allowedRead", "--operation", "deniedRead",
+                                 "--output", output]
+                    if execute:
+                        arguments.append("--execute")
+                    rejected = run(arguments, expected=1, environment=workload_environment)
+                    assert "response_schema_unsupported" in rejected.stderr, rejected.stderr
+                    assert not (directory / output).exists()
+                    assert len(requests) == before, "unsupported schemas must fail before setup or load"
+
             workload_arguments = [*workload_target, "--operation", "allowedRead",
                                   "--operation", "deniedRead", "--execute",
                                   "--output", "workload-report.json"]
@@ -553,7 +637,7 @@ components:
         server.shutdown()
         server.server_close()
         worker.join(timeout=2)
-    print(f"Release smoke passed: {version}; GET, POST, duration, statuses, timeout, JSON accounting, OpenAPI JSON/YAML/URL generation and byte limits, previews, authenticated GET/HEAD, reserved path data, partial-EOF cancellation, schema failure, workload actors/phases/denial/accounting, write opt-in/replay, thresholds/capture loss, redaction and output preservation")
+    print(f"Release smoke passed: {version}; GET, POST, duration, statuses, timeout, JSON accounting, OpenAPI JSON/YAML/URL generation and byte limits, decoded alias budgets, expanded schema preflight, previews, authenticated GET/HEAD, reserved path data, partial-EOF cancellation, schema failure, workload actors/phases/denial/accounting, write opt-in/replay, thresholds/capture loss, redaction and output preservation")
 
 
 if __name__ == "__main__":

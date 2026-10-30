@@ -120,6 +120,10 @@ any 2xx status passes; set an exact `401` or `403` for a denial case. An optiona
 inline `response_schema` checks JSON using the supported schema subset and local
 references, without external retrieval. It does not assert media type or JSON
 `format`. HEAD is bodyless and cannot have a response schema.
+The same [schema admission limits](openapi-suites.md#assertions-and-coverage) apply
+to workload response schemas; unsupported or over-budget schemas reject the
+plan during preflight, before setup or measured traffic. HTTP timeouts cover
+the response transfer, not synchronous schema validation.
 
 Header bindings contain complete header values: an `Authorization` environment
 value must include its `Bearer ` prefix. Cookie and CSRF values are supplied

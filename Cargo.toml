@@ -1,6 +1,6 @@
 [package]
 name = "rusta-pitest"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 edition = "2024"
 description = "A small CLI for testing and benchmarking HTTP APIs"
 license = "Apache-2.0"
@@ -37,6 +37,7 @@ include = [
     "/docs/releases/v0.1.0-alpha.2.md",
     "/docs/releases/v0.1.0-alpha.3.md",
     "/docs/releases/v0.1.0-alpha.4.md",
+    "/docs/releases/v0.1.0-alpha.5.md",
 ]
 
 [dependencies]

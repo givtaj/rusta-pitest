@@ -49,6 +49,11 @@ large-plan bookkeeping. Distribution checks verify included docs/examples and
 preview the extracted workload example. Functional fixture completion must be
 bounded, including teardown after a client rejects a response early.
 
+From alpha.5 onward, built and extracted binaries must also reject decoded YAML
+alias expansion beyond the configured input budget and excessive schema reference
+expansion before request execution. Small supported inputs must remain usable;
+rejected inputs must preserve existing output files and send no API traffic.
+
 The initial public alpha has 46 Rust tests. The Python suite includes four
 offline build-provenance regressions and notice-generation tests. The final
 published release records the observed counts; all discovered tests must pass.

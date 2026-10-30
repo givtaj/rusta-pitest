@@ -658,6 +658,62 @@ fn external_references_are_blocked_without_fetching_them() {
 }
 
 #[test]
+fn expanded_parameter_and_response_schemas_are_blocked_before_traffic() {
+    for parameter in [false, true] {
+        let directory = TempDir::new();
+        let server = Server::start(|_| Response::json(200, json!("synthetic")));
+        let mut schemas = serde_json::Map::new();
+        schemas.insert("n0".into(), json!({"type":"string","minLength":1}));
+        for level in 1..=12 {
+            let reference = format!("#/components/schemas/n{}", level - 1);
+            schemas.insert(
+                format!("n{level}"),
+                json!({"allOf":[
+                    {"$ref":reference}, {"$ref":reference}
+                ]}),
+            );
+        }
+        let schema = json!({"type":"string","allOf":[{"$ref":"#/components/schemas/n12"}]});
+        let mut spec = contract(json!({"/health":{"get":{
+            "operationId":"health","responses":response(json!(true))
+        }}}));
+        spec["components"] = json!({"schemas":schemas});
+        if parameter {
+            spec["paths"]["/health"]["get"]["parameters"] = json!([
+                {"name":"value","in":"query","required":true,"schema":schema}
+            ]);
+        } else {
+            spec["paths"]["/health"]["get"]["responses"] = response(schema);
+        }
+        let suite = directory.generate(&spec);
+        assert!(
+            directory.read_json("suite.json")["cases"][0]["blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason.as_str().unwrap().contains("schema"))
+        );
+        assert_exit(
+            &run(
+                &directory.0,
+                &[
+                    "suite",
+                    "run",
+                    &suite,
+                    "--base-url",
+                    &server.url,
+                    "--operation",
+                    "health",
+                    "--execute",
+                ],
+            ),
+            false,
+        );
+        assert!(server.finish().is_empty());
+    }
+}
+
+#[test]
 fn head_and_bodyless_successes_do_not_require_json_bodies() {
     let directory = TempDir::new();
     let spec = contract(json!({

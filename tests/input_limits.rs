@@ -550,3 +550,63 @@ fn raised_byte_limits_preserve_json_yaml_and_suite_complexity_guards() {
         );
     }
 }
+
+#[test]
+fn yaml_alias_expansion_uses_the_input_budget_before_publishing_a_suite() {
+    let directory = TempDir::new();
+    let mut document = documents()[1].1.clone();
+    let marker = "SYNTHETIC_INPUT_VALUE".repeat(32);
+    document.extend_from_slice(format!("x-value: &value '{marker}'\nx-copies:\n").as_bytes());
+    for _ in 0..16 {
+        document.extend_from_slice(b"  - *value\n");
+    }
+    let source = directory.file("aliases.yaml", &document);
+    let encoded_limit = document.len().to_string();
+    let rejected = directory.path("aliases-rejected.json");
+    let output = run(&[
+        "openapi",
+        "generate",
+        &source,
+        "--out",
+        &rejected,
+        "--max-input-bytes",
+        &encoded_limit,
+    ]);
+    rejected_without_output(&output, &rejected, "decoded string and key byte limit");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("SYNTHETIC_INPUT_VALUE"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("SYNTHETIC_INPUT_VALUE"));
+
+    for chunked in [false, true] {
+        let server = ContractServer::start(document.clone(), chunked);
+        let rejected = directory.path(&format!("aliases-http-{chunked}.json"));
+        rejected_without_output(
+            &run(&[
+                "openapi",
+                "generate",
+                &server.url,
+                "--out",
+                &rejected,
+                "--max-input-bytes",
+                &encoded_limit,
+            ]),
+            &rejected,
+            "decoded string and key byte limit",
+        );
+        assert_eq!(server.requests.load(Ordering::Relaxed), 1);
+    }
+
+    let accepted = directory.path("aliases-accepted.json");
+    succeeded(&run(&[
+        "openapi",
+        "generate",
+        &source,
+        "--out",
+        &accepted,
+        "--max-input-bytes",
+        "16384",
+    ]));
+    let suite: Value = serde_json::from_slice(&fs::read(&accepted).unwrap()).unwrap();
+    assert_eq!(suite["contract"]["x-copies"].as_array().unwrap().len(), 16);
+    assert_eq!(suite["contract"]["x-copies"][0], marker);
+    succeeded(&run(&["suite", "run", &accepted]));
+}

@@ -221,6 +221,36 @@ fn preview_reads_no_credentials_or_body_files_and_reviews_writes() {
 }
 
 #[test]
+fn expanded_response_schema_is_rejected_before_setup_or_measured_requests() {
+    let temp = Temp::new();
+    let server = Server::new();
+    let mut definitions = serde_json::Map::new();
+    definitions.insert("n0".into(), json!({"type":"object"}));
+    for level in 1..=12 {
+        let reference = format!("#/$defs/n{}", level - 1);
+        definitions.insert(
+            format!("n{level}"),
+            json!({"allOf":[
+                {"$ref":reference}, {"$ref":reference}
+            ]}),
+        );
+    }
+    let mut p = plan();
+    p["requests"]["read"]["response_schema"] = json!({
+        "$defs":definitions, "$ref":"#/$defs/n12"
+    });
+    p["setup"] = json!([{"actor":"a","request":"read"}]);
+    for execute in [false, true] {
+        let output = command(&temp, &p, execute.then_some(&server))
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("response_schema_unsupported"));
+        assert!(server.seen().is_empty());
+    }
+}
+
+#[test]
 fn actors_are_isolated_expected_denials_pass_and_secrets_are_redacted() {
     let temp = Temp::new();
     let server = Server::new();
