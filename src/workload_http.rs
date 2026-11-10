@@ -24,6 +24,10 @@ const MAX_HEADERS: usize = 64;
 const MAX_HEADER_VALUE_BYTES: usize = 8192;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_PATH_BYTES: usize = 8192;
+const MAX_QUERY_PAIRS: usize = 32;
+const MAX_QUERY_NAME_BYTES: usize = 128;
+const MAX_QUERY_VALUE_BYTES: usize = 4096;
+const MAX_QUERY_BYTES: usize = 8192;
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,12 +41,37 @@ pub struct Actor {
 pub struct RequestSpec {
     pub method: String,
     pub path: String,
+    #[serde(default)]
+    pub query: Vec<QueryPair>,
     pub body_env: Option<String>,
     pub body_file: Option<String>,
     pub content_type: Option<String>,
     pub idempotency_key_env: Option<String>,
     pub expect_status: Option<u16>,
     pub response_schema: Option<Value>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(try_from = "BTreeMap<String, String>")]
+pub struct QueryPair {
+    pub name: String,
+    pub value: String,
+}
+
+impl TryFrom<BTreeMap<String, String>> for QueryPair {
+    type Error = &'static str;
+
+    fn try_from(mut fields: BTreeMap<String, String>) -> Result<Self, Self::Error> {
+        // A derived struct deserializer also accepts positional arrays. A map
+        // enforces object-only pairs, and its value type requires strings.
+        if fields.len() != 2 {
+            return Err("query_pair_fields_invalid");
+        }
+        Ok(Self {
+            name: fields.remove("name").ok_or("query_pair_fields_invalid")?,
+            value: fields.remove("value").ok_or("query_pair_fields_invalid")?,
+        })
+    }
 }
 
 pub struct PreparedRequest {
@@ -92,7 +121,12 @@ pub fn prepare(
         }
         _ => return Err("method_unsupported".into()),
     };
-    let url = target_url(base, &spec.path)?;
+    let mut url = target_url(base, &spec.path)?;
+    // Keep the caller-selected origin/path fixed before attaching raw query
+    // data. Validate and freeze it before loading credentials or body files.
+    if let Some(query) = encode_query(&spec.query)? {
+        url.set_query(Some(&query));
+    }
     if spec.body_env.is_some() && spec.body_file.is_some() {
         return Err("conflicting_body_bindings".into());
     }
@@ -272,6 +306,59 @@ fn target_url(base: &Url, path: &str) -> Result<Url, String> {
         return Err("request_path_invalid".into());
     }
     Ok(url)
+}
+
+fn query_unreserved(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+}
+
+fn encode_query(pairs: &[QueryPair]) -> Result<Option<String>, String> {
+    if pairs.is_empty() {
+        return Ok(None);
+    }
+    if pairs.len() > MAX_QUERY_PAIRS {
+        return Err("query_pair_limit".into());
+    }
+    // Count the encoded bytes, including '=' and '&', before allocating or
+    // expanding the input. The bounded pair/field lengths prevent overflow.
+    let mut size = pairs.len() - 1;
+    for pair in pairs {
+        if pair.name.is_empty() || pair.name.len() > MAX_QUERY_NAME_BYTES {
+            return Err("query_name_empty_or_exceeds_limit".into());
+        }
+        if pair.value.len() > MAX_QUERY_VALUE_BYTES {
+            return Err("query_value_exceeds_limit".into());
+        }
+        size += 1;
+        for byte in pair.name.bytes().chain(pair.value.bytes()) {
+            size += if query_unreserved(byte) { 1 } else { 3 };
+        }
+        if size > MAX_QUERY_BYTES {
+            return Err("query_encoded_bytes_exceed_limit".into());
+        }
+    }
+    let mut encoded = String::with_capacity(size);
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for (index, pair) in pairs.iter().enumerate() {
+        if index > 0 {
+            encoded.push('&');
+        }
+        for (part, value) in [&pair.name, &pair.value].into_iter().enumerate() {
+            if part > 0 {
+                encoded.push('=');
+            }
+            for byte in value.bytes() {
+                if query_unreserved(byte) {
+                    encoded.push(char::from(byte));
+                } else {
+                    encoded.push('%');
+                    encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+                    encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+                }
+            }
+        }
+    }
+    Ok(Some(encoded))
 }
 
 fn validate_path(path: &str, request: bool) -> Result<(), String> {
@@ -473,6 +560,7 @@ mod tests {
         RequestSpec {
             method: method.into(),
             path: path.into(),
+            query: Vec::new(),
             body_env: None,
             body_file: None,
             content_type: None,
@@ -494,6 +582,96 @@ mod tests {
 
     fn preview(spec: &RequestSpec) -> Result<PreparedRequest, String> {
         prepare(&base(), &actor(), spec, Path::new("/missing"), false, false)
+    }
+
+    fn pair(name: &str, value: &str) -> QueryPair {
+        QueryPair {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+
+    #[test]
+    fn query_encoding_preserves_origin_path_order_and_raw_utf8() {
+        let mut request = spec("GET", "/widgets/red%3Bblue");
+        assert!(preview(&request).unwrap().request.url().query().is_none());
+        request.query = vec![
+            pair("a&= +%", ":/?#[]@!$&'()*+,;=%2F "),
+            pair("tag", "café/猫"),
+            pair("tag", ""),
+            pair("unreserved", "AZaz09-._~"),
+            pair("controls", "\0\r\n\t"),
+        ];
+        let plan = preview(&request).unwrap();
+        assert_eq!(plan.request.url().origin(), base().origin());
+        assert_eq!(plan.request.url().path(), "/api/v1/widgets/red%3Bblue");
+        assert_eq!(plan.request.url().fragment(), None);
+        assert_eq!(
+            plan.request.url().query().unwrap(),
+            "a%26%3D%20%2B%25=%3A%2F%3F%23%5B%5D%40%21%24%26%27%28%29%2A%2B%2C%3B%3D%252F%20&tag=caf%C3%A9%2F%E7%8C%AB&tag=&unreserved=AZaz09-._~&controls=%00%0D%0A%09"
+        );
+        let decoded: Vec<_> = plan.request.url().query_pairs().collect();
+        for ((name, value), original) in decoded.iter().zip(&request.query) {
+            assert_eq!(name, &original.name);
+            assert_eq!(value, &original.value);
+        }
+    }
+
+    #[test]
+    fn query_limits_include_utf8_expansion_and_separators() {
+        assert!(encode_query(&vec![pair("x", ""); MAX_QUERY_PAIRS]).is_ok());
+        assert_eq!(
+            encode_query(&vec![pair("x", ""); MAX_QUERY_PAIRS + 1]).unwrap_err(),
+            "query_pair_limit"
+        );
+        assert!(encode_query(&[pair(&"é".repeat(64), "")]).is_ok());
+        assert_eq!(
+            encode_query(&[pair(&"é".repeat(65), "")]).unwrap_err(),
+            "query_name_empty_or_exceeds_limit"
+        );
+        assert!(encode_query(&[pair("x", &"x".repeat(MAX_QUERY_VALUE_BYTES))]).is_ok());
+        assert_eq!(
+            encode_query(&[pair("x", &"x".repeat(MAX_QUERY_VALUE_BYTES + 1))]).unwrap_err(),
+            "query_value_exceeds_limit"
+        );
+        let exact = vec![pair("x", &"x".repeat(4096)), pair("y", &"y".repeat(4091))];
+        assert_eq!(
+            encode_query(&exact).unwrap().unwrap().len(),
+            MAX_QUERY_BYTES
+        );
+        let mut excessive = exact;
+        excessive[1].value.push('y');
+        assert_eq!(
+            encode_query(&excessive).unwrap_err(),
+            "query_encoded_bytes_exceed_limit"
+        );
+        let expanded = format!("{}xx", "é".repeat(1364));
+        assert_eq!(
+            encode_query(&[pair("q", &expanded)])
+                .unwrap()
+                .unwrap()
+                .len(),
+            8188
+        );
+        assert_eq!(
+            encode_query(&[pair("q", &format!("{expanded}é"))]).unwrap_err(),
+            "query_encoded_bytes_exceed_limit"
+        );
+    }
+
+    #[test]
+    fn query_validation_precedes_runtime_secret_loading() {
+        let mut request = spec("GET", "/items");
+        request.query = vec![pair("", "private-query-value")];
+        let actor = Actor {
+            headers_env: BTreeMap::from([("Cookie".into(), "RUSTA_MISSING_QUERY_TEST".into())]),
+        };
+        assert_eq!(
+            prepare(&base(), &actor, &request, Path::new("."), true, false)
+                .err()
+                .unwrap(),
+            "query_name_empty_or_exceeds_limit"
+        );
     }
 
     #[test]
@@ -1224,6 +1402,11 @@ mod tests {
         let bytes = b"immutable\0body\xffbytes";
         std::fs::write(directory.0.join("body.bin"), bytes).unwrap();
         let mut request = spec("POST", "/write");
+        request.query = vec![
+            pair("cursor", "frozen +%2F"),
+            pair("tag", ""),
+            pair("tag", "b"),
+        ];
         request.body_file = Some("body.bin".into());
         request.content_type = Some("application/octet-stream".into());
         request.idempotency_key_env = Some("RUSTA_HTTP_KEY".into());
@@ -1235,6 +1418,7 @@ mod tests {
         };
         let plan_a = prepare(&server.url, &actor_a, &request, &directory.0, true, true).unwrap();
         let plan_b = prepare(&server.url, &actor_b, &request, &directory.0, true, true).unwrap();
+        request.query[0].value = "modified after preflight".into();
         std::fs::write(directory.0.join("body.bin"), b"modified after preflight").unwrap();
         let http = client(500).unwrap();
         assert!(execute(&http, &plan_a).await.passed);
@@ -1247,7 +1431,10 @@ mod tests {
             assert_eq!(captured[1].headers["cookie"], "session=synthetic-actor-b");
             assert_eq!(captured[2].headers["cookie"], "session=synthetic-actor-a");
             for captured in captured.iter() {
-                assert_eq!(captured.path, "/prefix/write");
+                assert_eq!(
+                    captured.path,
+                    "/prefix/write?cursor=frozen%20%2B%252F&tag=&tag=b"
+                );
                 assert_eq!(captured.body, bytes);
                 assert_eq!(
                     captured.headers["idempotency-key"],

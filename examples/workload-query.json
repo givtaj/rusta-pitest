@@ -1,0 +1,37 @@
+{
+  "workload_version": 1,
+  "actors": {"reader": {}},
+  "requests": {
+    "ready": {"method": "GET", "path": "/query-ready", "expect_status": 200},
+    "search": {
+      "method": "GET",
+      "path": "/query-demo",
+      "query": [
+        {"name": "tag", "value": "alpha"},
+        {"name": "tag", "value": "beta"},
+        {"name": "q", "value": "blue sky+%/?#&="},
+        {"name": "empty", "value": ""},
+        {"name": "utf8", "value": "café"},
+        {"name": "literal", "value": "%2F"}
+      ],
+      "expect_status": 200,
+      "response_schema": {
+        "type": "object", "required": ["ok"],
+        "properties": {"ok": {"const": true}}
+      }
+    }
+  },
+  "groups": {
+    "reads": {"actors": ["reader"], "max_in_flight": 1, "requests": ["search"]}
+  },
+  "setup": [{"actor": "reader", "request": "ready"}],
+  "phases": [{"name": "query-demo", "duration_ms": 100, "rates": {"reads": 1}}],
+  "max_in_flight": 1,
+  "timeout_ms": 2000,
+  "drain_timeout_ms": 2000,
+  "max_start_lag_ms": 500,
+  "thresholds": [
+    {"metric": "error_rate", "maximum": 0},
+    {"metric": "unsent_rate", "maximum": 0}
+  ]
+}

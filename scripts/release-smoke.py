@@ -45,6 +45,22 @@ def main():
     workload_cookie = "session=rusta-workload-cookie-secret"
     workload_csrf = "rusta-workload-csrf-secret"
     workload_path = "/workload-smoke/runtime-private-path"
+    workload_query_path = "/workload-query"
+    workload_query_pairs = [
+        {"name": "rusta-query-tag-private", "value": "rusta-query-one-private"},
+        {"name": "rusta-query-tag-private", "value": "rusta-query-two-private"},
+        {"name": "rusta-query-name +%/?#&=é", "value": "rusta-query-value 雪+%/?#&="},
+        {"name": "rusta-query-empty-private", "value": ""},
+        {"name": "rusta-query-literal-private", "value": "%2F"},
+    ]
+    # A literal wire expectation makes this independent of the runner's encoder.
+    workload_query_wire = (
+        "/workload-query?rusta-query-tag-private=rusta-query-one-private"
+        "&rusta-query-tag-private=rusta-query-two-private"
+        "&rusta-query-name%20%2B%25%2F%3F%23%26%3D%C3%A9="
+        "rusta-query-value%20%E9%9B%AA%2B%25%2F%3F%23%26%3D"
+        "&rusta-query-empty-private=&rusta-query-literal-private=%252F"
+    )
     widget_response = {"200": {
         "description": "Synthetic widget",
         "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Widget"}}},
@@ -98,6 +114,10 @@ def main():
             status = 503 if self.path == "/failure" else 200
             if self.path == "/openapi.json":
                 payload = json.dumps(openapi_contract).encode()
+            elif self.path.startswith(workload_query_path + "?"):
+                matched = self.path == workload_query_wire
+                status = 200 if matched else 400
+                payload = json.dumps({"matched": matched, "private": self.path}).encode()
             elif self.path.startswith("/suite-cookie/"):
                 cookie_headers = self.headers.get_all("Cookie", [])
                 with lock:
@@ -668,6 +688,77 @@ components:
                 assert counts["in_flight"] == 0
                 return result, document
 
+            query_plan = {
+                "workload_version": 1, "actors": {"reader": {}},
+                "requests": {
+                    "ready": {"method": "GET", "path": "/workload-query-ready", "query": [],
+                              "expect_status": 200},
+                    "search": {"method": "GET", "path": workload_query_path,
+                               "query": workload_query_pairs, "expect_status": 200,
+                               "response_schema": {"type": "object", "required": ["matched"],
+                                                   "properties": {"matched": {"const": True}}}},
+                },
+                "groups": {"reads": {"actors": ["reader"], "max_in_flight": 1,
+                                     "requests": ["search"]}},
+                "setup": [{"actor": "reader", "request": "ready"}],
+                "phases": [{"name": "query", "duration_ms": 100, "rates": {"reads": 1}}],
+                "max_in_flight": 1, "max_start_lag_ms": 500,
+                "timeout_ms": 2000, "drain_timeout_ms": 2000,
+            }
+            (directory / "query-preview.plan.json").write_text(json.dumps(query_plan))
+            before = len(requests)
+            query_preview_result = run(["workload", "run", "query-preview.plan.json",
+                                        "--base-url", origin])
+            query_preview = json.loads(query_preview_result.stdout)
+            check_identity(query_preview["runner"])
+            assert query_preview["schema_version"] == 2 and query_preview["workload_version"] == 1
+            assert query_preview["passed"] is None and query_preview["executed"] is False
+            assert query_preview["runtime_secrets_loaded"] is False
+            assert len(requests) == before, "query preview must send no setup or load traffic"
+            query_result, query_report = workload_case("workload-query", query_plan)
+            assert query_report["counts"]["offered"] == query_report["counts"]["passed"] == 1
+            assert [(method, path) for method, path, _ in requests[before:]] == [
+                ("GET", "/workload-query-ready"), ("GET", workload_query_wire),
+            ]
+            query_markers = {pair["name"] for pair in workload_query_pairs}
+            query_markers.update(pair["value"] for pair in workload_query_pairs if pair["value"])
+            query_markers.update((workload_query_path, workload_query_wire,
+                                  "rusta-query-name%20", "rusta-query-value%20"))
+            for document, result in ((query_preview, query_preview_result), (query_report, query_result)):
+                evidence = json.dumps(document, ensure_ascii=False) + result.stdout + result.stderr
+                for marker in query_markers:
+                    assert marker not in evidence, "workload report disclosed query data"
+
+            invalid_queries = {
+                "null": None,
+                "tuple-pair": [["rusta-query-invalid-private", "value-private"]],
+                "empty-name": [{"name": "", "value": "rusta-query-invalid-private"}],
+                "name-type": [{"name": 7, "value": "rusta-query-invalid-private"}],
+                "nested-value": [{"name": "rusta-query-invalid-private", "value": ["nested-private"]}],
+                "unknown-field": [{"name": "rusta-query-invalid-private", "value": "value-private",
+                                   "extra": "rusta-query-extra-private"}],
+                "pair-budget": [{"name": "rusta-query-invalid-private", "value": ""}] * 33,
+                "name-budget": [{"name": "rusta-query-invalid-private" + "n" * 128, "value": ""}],
+                "value-budget": [{"name": "rusta-query-invalid-private", "value": "v" * 4097}],
+                "encoded-budget": [{"name": "rusta-query-invalid-private", "value": "é" * 2048}],
+            }
+            before = len(requests)
+            for name, query in invalid_queries.items():
+                invalid = json.loads(json.dumps(query_plan))
+                invalid["requests"]["search"]["query"] = query
+                filename = f"query-invalid-{name}.plan.json"
+                (directory / filename).write_text(json.dumps(invalid))
+                for execute in (False, True):
+                    output = f"query-invalid-{name}-{execute}.report.json"
+                    rejected = run(["workload", "run", filename, "--base-url", origin,
+                                    "--operation", "ready", "--operation", "search",
+                                    *(["--execute"] if execute else []), "--output", output], expected=1)
+                    assert not (directory / output).exists()
+                    assert len(requests) == before, "invalid queries must fail before setup or load"
+                    for marker in ("rusta-query-invalid-private", "nested-private", "value-private",
+                                   "rusta-query-extra-private", "é", "v" * 4097):
+                        assert marker not in rejected.stdout + rejected.stderr
+
             write_key = "rusta-smoke-immutable-idempotency-secret"
             write_body = b"immutable\x00rusta-smoke-body-secret\xff\n"
             write_plan = {
@@ -729,7 +820,7 @@ components:
         server.shutdown()
         server.server_close()
         worker.join(timeout=2)
-    print(f"Release smoke passed: {version}; GET, POST, duration, statuses, timeout, JSON accounting, OpenAPI JSON/YAML/URL generation and byte limits, decoded alias budgets, expanded schema preflight, previews, authenticated GET/HEAD, cookie bindings/isolation/denial, reserved path data, partial-EOF cancellation, schema failure, workload actors/phases/denial/accounting, write opt-in/replay, thresholds/capture loss, redaction and output preservation")
+    print(f"Release smoke passed: {version}; GET, POST, duration, statuses, timeout, JSON accounting, OpenAPI JSON/YAML/URL generation and byte limits, decoded alias budgets, expanded schema preflight, previews, authenticated GET/HEAD, cookie bindings/isolation/denial, reserved path data, partial-EOF cancellation, schema failure, workload actors/phases/denial/accounting, structured query encoding/preflight/redaction, write opt-in/replay, thresholds/capture loss, redaction and output preservation")
 
 
 if __name__ == "__main__":

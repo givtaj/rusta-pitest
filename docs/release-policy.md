@@ -56,6 +56,14 @@ large-plan bookkeeping. Distribution checks verify included docs/examples and
 preview the extracted workload example. Functional fixture completion must be
 bounded, including teardown after a client rejects a response early.
 
+Candidates containing structured workload queries must verify exact percent
+encoding, repeated-name ordering, empty values, UTF-8 data, and query redaction
+through the built and extracted release binaries. Malformed fields and query
+budgets must reject the plan before setup as well as measured traffic. Preview
+must remain nonexecuting, and plans omitting queries must keep their existing
+behavior. The complete synthetic query example must be packaged and previewable.
+This unreleased addition retains workload version 1 and report schema version 2.
+
 From alpha.5 onward, built and extracted binaries must also reject decoded YAML
 alias expansion beyond the configured input budget and excessive schema reference
 expansion before request execution. Small supported inputs must remain usable;

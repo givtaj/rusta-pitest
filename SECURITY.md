@@ -47,6 +47,15 @@ These workload-report rules do not remove the direct-command argument/terminal
 exposure described above. Environment access and target-service behavior remain
 part of the caller's environment. See [workloads](docs/workloads.md).
 
+The unreleased structured-query field stores literal names and values in the
+workload plan; it does not resolve environment variables or response data.
+Treat plans containing private query data as private files and review them before
+sharing or committing. Query names and values are omitted from runner previews,
+reports, evidence, and diagnostics, but a target or intermediary may log the
+complete request URL. Do not use query parameters to transport credentials.
+The runner does not control external logs, follow pagination, or redact private
+data deliberately placed in visible actor/request/group/phase IDs.
+
 The release process audits locked dependencies and verifies artifact checksums.
 A passing advisory scan reflects the database checked at that time; report newly
 disclosed or otherwise undetected issues through the private channel above.

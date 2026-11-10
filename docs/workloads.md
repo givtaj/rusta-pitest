@@ -26,6 +26,15 @@ class Demo(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if self.path == "/query-ready":
+            return self.reply(200, {"ready": True})
+        if self.path.startswith("/query-demo?"):
+            expected = (
+                "/query-demo?tag=alpha&tag=beta&q=blue%20sky%2B%25%2F%3F%23%26%3D"
+                "&empty=&utf8=caf%C3%A9&literal=%252F"
+            )
+            matched = self.path == expected
+            return self.reply(200 if matched else 400, {"ok": matched})
         if self.path == "/denied":
             return self.reply(401, {"denied": True})
         cookie = self.headers.get("Cookie", "")
@@ -115,7 +124,8 @@ already percent-encoded path data where necessary; no response extraction or
 dynamic URL templating occurs.
 
 Optional request fields are `expect_status`, `response_schema`, `body_env`,
-`body_file`, `content_type`, and `idempotency_key_env`. Without `expect_status`,
+`body_file`, `content_type`, `idempotency_key_env`, and `query` (unreleased).
+Without `expect_status`,
 any 2xx status passes; set an exact `401` or `403` for a denial case. An optional
 inline `response_schema` checks JSON using the supported schema subset and local
 references, without external retrieval. It does not assert media type or JSON
@@ -139,6 +149,68 @@ credentials or bodies. Acquire credentials, reset fixtures, and perform any
 renewal through a separately controlled harness before launching a new run.
 Setup results have `measured: false` and do not enter measured counters/latencies;
 a failed setup prevents measured requests from starting.
+
+## Structured query parameters
+
+**Unreleased:** development builds support an optional ordered `query` array
+on each request. Published alpha.5 does not include it. Supply literal strings
+as separate name/value pairs:
+
+```json
+"query": [
+  {"name": "tag", "value": "alpha"},
+  {"name": "tag", "value": "beta"},
+  {"name": "q", "value": "blue sky+%/?#&="},
+  {"name": "empty", "value": ""}
+]
+```
+
+Repeated names and pair order are preserved. Omitted `query` and `query: []`
+send no query and no trailing `?`. Names must be nonempty strings of at most
+128 UTF-8 bytes; values are strings of at most 4096 UTF-8 bytes and may be empty.
+There may be at most 32 pairs and at most 8192 serialized query bytes, including
+`=` and `&` separators but excluding `?`. A pair accepts exactly `name` and
+`value`; unknown fields, nulls, numbers, nested arrays, and other non-string
+names/values are rejected. These checks run before setup or measured traffic.
+
+Names and values are encoded individually. ASCII letters, digits, `-`, `.`, `_`,
+and `~` remain literal; every other UTF-8 byte becomes uppercase `%HH`. A space
+becomes `%20`, a plus becomes `%2B`, and a literal percent becomes `%25`.
+Input is never percent-decoded: a literal `%2F` becomes `%252F` on the wire.
+The example above produces
+`tag=alpha&tag=beta&q=blue%20sky%2B%25%2F%3F%23%26%3D&empty=`.
+Do not pre-encode query values or append raw queries to `path` or `--base-url`;
+both still reject raw query strings and fragments.
+
+Query values are static literals in the private plan. There is no environment
+binding, variable interpolation, response extraction, automatic pagination, or
+cursor walking. A literal `${TOKEN}` is sent as literal data, not resolved.
+Review plan files before sharing or committing them. Queries are unsuitable for
+credentials: a target, proxy, or access log may record the complete URL. The
+runner omits query names and values from preview, execution reports, evidence,
+and diagnostics; external logging remains outside its control. Authored IDs
+remain visible, so do not encode private query data into IDs.
+
+To run the [complete synthetic query plan](../examples/workload-query.json),
+start the Python fixture from the first section, then use a build containing
+this feature:
+
+```sh
+cargo run --locked -- workload run examples/workload-query.json
+cargo run --locked --release -- workload run examples/workload-query.json \
+  --execute --base-url http://127.0.0.1:8001 \
+  --operation ready --operation search \
+  --output /tmp/workload-query.report.json
+```
+
+This example sends one anonymous setup read and one measured read. The fixture
+checks the exact repeated, empty, Unicode, and reserved-character query bytes.
+No credentials or write permission are needed. Choose a new report path for
+each execution.
+
+`workload_version` remains 1 and report `schema_version` remains 2. Existing plans
+that omit `query` keep their behavior. Older binaries reject plans containing
+the new field, including an empty array, rather than silently dropping it.
 
 ## Sequences and deliberate writes
 
