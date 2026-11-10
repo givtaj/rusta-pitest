@@ -511,15 +511,21 @@ fn validate_security(contract: &Value, case: &mut Case) {
                     .get("scheme")
                     .and_then(Value::as_str)
                     .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer")),
-                Some("apiKey") => {
-                    scheme.get("in").and_then(Value::as_str) == Some("header")
-                        && scheme
+                Some("apiKey") => match scheme.get("in").and_then(Value::as_str) {
+                    Some("header") => {
+                        scheme
                             .get("name")
                             .and_then(Value::as_str)
                             .is_some_and(|name| {
                                 !name.is_empty() && !name.chars().any(char::is_control)
                             })
-                }
+                    }
+                    Some("cookie") => scheme
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(crate::cookie::valid_name),
+                    _ => false,
+                },
                 _ => false,
             };
         }
@@ -531,7 +537,7 @@ fn validate_security(contract: &Value, case: &mut Case) {
     if !any_supported {
         block(
             case,
-            "security requires unsupported authentication; MVP supports bearer and header API keys",
+            "security requires unsupported authentication; supported schemes are bearer and header/cookie API keys",
         );
     }
 }

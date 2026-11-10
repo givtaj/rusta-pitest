@@ -38,6 +38,13 @@ requirements, authentication/header conflicts, request budgets, rate pacing,
 full-response timeouts, and response-size limits against disposable loopback
 fixtures. These checks do not authorize traffic to external services.
 
+Candidates containing cookie security bindings must additionally verify exact
+cookie construction, isolated synthetic users, failed positive assertions for
+documented 401/403 responses, traffic-free preview without resolving secrets,
+and preflight rejection of missing/malformed/conflicting bindings. Built and
+extracted binaries must pass the cookie-authentication release smoke. This
+unreleased capability retains suite/report version 1 and selected GET/HEAD scope.
+
 From alpha.4 onward, built and extracted binaries must additionally pass authored
 workload preview without secrets/traffic, isolated actor headers, expected denial,
 schema-v2 accounting/redaction, explicit write refusal and opted-in immutable replay,

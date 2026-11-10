@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Bind declared OpenAPI cookie security schemes privately through `--auth-env`,
+  preserving selected GET/HEAD execution and security alternatives/combinations.
+- Validate cookie names and opaque values before traffic, reject conflicting
+  cookie bindings, and serialize combined cookies deterministically.
+- Cover isolated synthetic users, denied positive cases, preview without secret
+  resolution, and credential redaction in regressions and release-binary smokes.
+
 ## 0.1.0-alpha.5 — 2026-10-29
 
 - Bound decoded string and object-key bytes during JSON/YAML parsing, including

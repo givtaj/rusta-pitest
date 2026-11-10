@@ -19,27 +19,83 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "rusta-pitest-openapi-{}-{}",
+        // Keep fixtures below the build checkout instead of trusting runtime TMPDIR.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("openapi-test-fixtures");
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.recursive(true).create(&root).unwrap();
+        let metadata = fs::symlink_metadata(&root).unwrap();
+        assert!(
+            metadata.is_dir(),
+            "test fixture root must be a real directory"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Trust the checkout, but refuse writable parents that permit another
+            // user to replace the private fixture directories. Never chmod them.
+            let target = fs::metadata(root.parent().unwrap()).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o022, 0);
+            assert_eq!(target.permissions().mode() & 0o022, 0);
+        }
+        let root = root.canonicalize().unwrap();
+        let path = root.join(format!(
+            "{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir(&path).unwrap();
+        // Exclusive creation refuses pre-existing directories or symlinks.
+        builder.recursive(false).create(&path).unwrap();
+        let path = path.canonicalize().unwrap();
+        if !path.starts_with(&root) || path.parent() != Some(root.as_path()) {
+            panic!("test fixture directory escaped its root");
+        }
         Self(path)
     }
 
+    fn fixture_path(&self, name: &str) -> PathBuf {
+        // Only closed, portable leaf names are accepted; no absolute or nested paths.
+        assert!(
+            !name.is_empty()
+                && name != "."
+                && !name.contains("..")
+                && name.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+                }),
+            "invalid test fixture leaf name"
+        );
+        self.0.join(name)
+    }
+
     fn write(&self, name: &str, bytes: impl AsRef<[u8]>) -> String {
-        let path = self.0.join(name);
-        fs::write(&path, bytes).unwrap();
+        let path = self.fixture_path(name);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(&path)
+            .unwrap()
+            .write_all(bytes.as_ref())
+            .unwrap();
         path.to_str().unwrap().to_owned()
     }
 
     fn path(&self, name: &str) -> String {
-        self.0.join(name).to_str().unwrap().to_owned()
+        self.fixture_path(name).to_str().unwrap().to_owned()
     }
 
     fn read_json(&self, name: &str) -> Value {
-        serde_json::from_slice(&fs::read(self.0.join(name)).unwrap()).unwrap()
+        serde_json::from_slice(&fs::read(self.fixture_path(name)).unwrap()).unwrap()
     }
 
     fn generate(&self, contract: &Value) -> String {
@@ -1325,5 +1381,778 @@ fn response_size_limit_is_inclusive_and_oversized_payloads_are_not_persisted() {
             );
         }
         assert_redacted(&output, Path::new(&report), &["oversized-private-response"]);
+    }
+}
+
+fn cookie_contract(requirements: Value) -> Value {
+    let mut spec = authentication_contract(requirements);
+    spec["components"]["securitySchemes"]["session"] =
+        json!({"type":"apiKey", "in":"cookie", "name":"session_id"});
+    spec
+}
+
+fn run_cookie_suite(
+    directory: &TempDir,
+    suite: &str,
+    server: &Server,
+    operations: &[&str],
+    bindings: &[&str],
+    environment: &[(&str, &str)],
+    execute: bool,
+) -> Output {
+    let report = directory.path("result.json");
+    let mut args = vec![
+        "suite",
+        "run",
+        suite,
+        "--base-url",
+        &server.url,
+        "--rate-per-second",
+        "100",
+        "--output",
+        &report,
+    ];
+    for operation in operations {
+        args.extend(["--operation", operation]);
+    }
+    for binding in bindings {
+        args.extend(["--auth-env", binding]);
+    }
+    if execute {
+        args.push("--execute");
+    }
+    run_env(&directory.0, &args, environment)
+}
+
+fn assert_cookie_preflight_refused(directory: &TempDir, output: &Output, secrets: &[&str]) {
+    assert_exit(output, false);
+    assert!(matches!(
+        fs::symlink_metadata(directory.fixture_path("result.json")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ));
+    let diagnostics = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for secret in secrets {
+        assert!(
+            !diagnostics.contains(secret),
+            "credential leaked in preflight diagnostics"
+        );
+    }
+}
+
+#[test]
+fn cookie_authentication_isolates_two_users_and_omits_unselected_and_public_credentials() {
+    let directory = TempDir::new();
+    let mut spec = cookie_contract(json!([]));
+    for (path, id, scheme) in [
+        ("/owned/alice", "alice", "aliceSession"),
+        ("/owned/bob", "bob", "bobSession"),
+        ("/unselected", "unselected", "unusedSession"),
+    ] {
+        spec["paths"][path] = spec["paths"]["/health"].clone();
+        spec["paths"][path]["get"]["operationId"] = json!(id);
+        spec["paths"][path]["get"]["security"] = json!([{scheme:[]}]);
+        spec["components"]["securitySchemes"][scheme] =
+            json!({"type":"apiKey", "in":"cookie", "name":"session_id"});
+    }
+    let suite = directory.generate(&spec);
+    let server = Server::start(|request| {
+        let valid = match request.path.as_str() {
+            "/owned/alice" => has_header(request, "cookie", "session_id=alice-session-private"),
+            "/owned/bob" => has_header(request, "cookie", "session_id=bob-session-private"),
+            "/health" => !request.headers.iter().any(|(name, _)| name == "cookie"),
+            _ => false,
+        };
+        Response::json(if valid { 200 } else { 403 }, json!({"status":"ok"}))
+    });
+    let output = run_cookie_suite(
+        &directory,
+        &suite,
+        &server,
+        &["alice", "bob", "health"],
+        &[
+            "aliceSession=RUSTA_COOKIE_ALICE",
+            "bobSession=RUSTA_COOKIE_BOB",
+            "unusedSession=RUSTA_SUITE_MISSING_AUTH_TOKEN",
+        ],
+        &[
+            ("RUSTA_COOKIE_ALICE", "alice-session-private"),
+            ("RUSTA_COOKIE_BOB", "bob-session-private"),
+        ],
+        true,
+    );
+    assert_exit(&output, true);
+    let report = directory.read_json("result.json");
+    assert_eq!(report["counts"]["passed"], 3);
+    assert_eq!(report["counts"]["skipped"], 1);
+    let requests = server.finish();
+    assert_eq!(requests.len(), 3);
+    assert!(requests.iter().all(|request| request.method == "GET"));
+    assert!(!requests.iter().any(|request| request.path == "/unselected"));
+    for request in &requests {
+        let cookies: Vec<_> = request
+            .headers
+            .iter()
+            .filter(|(name, _)| name == "cookie")
+            .collect();
+        match request.path.as_str() {
+            "/owned/alice" => assert_eq!(cookies[0].1, "session_id=alice-session-private"),
+            "/owned/bob" => assert_eq!(cookies[0].1, "session_id=bob-session-private"),
+            "/health" => assert!(cookies.is_empty()),
+            _ => panic!("unexpected operation"),
+        }
+        assert!(cookies.len() <= 1);
+    }
+    assert_redacted(
+        &output,
+        Path::new(&directory.path("result.json")),
+        &[
+            "alice-session-private",
+            "bob-session-private",
+            "RUSTA_COOKIE_ALICE",
+            "RUSTA_COOKIE_BOB",
+        ],
+    );
+    let generated = fs::read_to_string(&suite).unwrap();
+    assert!(
+        !generated.contains("alice-session-private") && !generated.contains("bob-session-private")
+    );
+}
+
+#[test]
+fn cookie_revoked_unknown_and_wrong_user_credentials_fail_documented_positive_cases() {
+    for (secret, expected_status) in [
+        ("revoked-session-private", 401),
+        ("unknown-session-private", 401),
+        ("bob-session-private", 403),
+        ("alice-session-private", 200),
+    ] {
+        let directory = TempDir::new();
+        let mut spec = cookie_contract(json!([{"session":[]}]));
+        for status in ["401", "403"] {
+            spec["paths"]["/health"]["get"]["responses"][status] = json!({"description":"Documented denial", "content":{"application/json":{"schema":{"type":"object"}}}});
+        }
+        let suite = directory.generate(&spec);
+        let server = Server::start(|request| {
+            let status = if has_header(request, "cookie", "session_id=alice-session-private") {
+                200
+            } else if has_header(request, "cookie", "session_id=bob-session-private") {
+                403
+            } else {
+                401
+            };
+            Response::json(
+                status,
+                json!({"status":"ok", "private":"denial-response-private"}),
+            )
+        });
+        let output = run_cookie_suite(
+            &directory,
+            &suite,
+            &server,
+            &["health"],
+            &["session=RUSTA_COOKIE_SESSION"],
+            &[("RUSTA_COOKIE_SESSION", secret)],
+            true,
+        );
+        assert_exit(&output, expected_status == 200);
+        let report = directory.read_json("result.json");
+        assert_eq!(report["cases"][0]["status"], expected_status);
+        assert_eq!(report["passed"], expected_status == 200);
+        if expected_status != 200 {
+            assert!(
+                report["cases"][0]["reasons"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|reason| reason == "unexpected_positive_status")
+            );
+        }
+        assert_eq!(server.finish().len(), 1);
+        assert_redacted(
+            &output,
+            Path::new(&directory.path("result.json")),
+            &[secret, "denial-response-private"],
+        );
+    }
+}
+
+#[test]
+fn cookie_and_security_constructs_one_exact_sorted_header_without_encoding() {
+    let directory = TempDir::new();
+    let mut spec =
+        cookie_contract(json!([{"session":[], "first":[], "lower":[], "bearer":[], "apiKey":[]}]));
+    spec["components"]["securitySchemes"]["session"]["name"] = json!("z_session");
+    spec["components"]["securitySchemes"]["first"] =
+        json!({"type":"apiKey", "in":"cookie", "name":"A!#$%&'*+-.^_`|~"});
+    spec["components"]["securitySchemes"]["lower"] =
+        json!({"type":"apiKey", "in":"cookie", "name":"a!#$%&'*+-.^_`|~"});
+    let suite = directory.generate(&spec);
+    let first = "opaque!#$%&'()*+-./:<=>?@[]^_`{|}~";
+    let session = "opaque%2F+value/with==padding";
+    let expected = format!(
+        "A!#$%&'*+-.^_`|~={first}; a!#$%&'*+-.^_`|~=case-private-cookie; z_session={session}"
+    );
+    let server = Server::start(|_| Response::json(200, json!({"status":"ok"})));
+    let output = run_cookie_suite(
+        &directory,
+        &suite,
+        &server,
+        &["health"],
+        &[
+            "session=RUSTA_COOKIE_Z",
+            "first=RUSTA_COOKIE_A",
+            "lower=RUSTA_COOKIE_LOWER",
+            "bearer=RUSTA_COOKIE_BEARER",
+            "apiKey=RUSTA_COOKIE_KEY",
+        ],
+        &[
+            ("RUSTA_COOKIE_Z", session),
+            ("RUSTA_COOKIE_A", first),
+            ("RUSTA_COOKIE_LOWER", "case-private-cookie"),
+            ("RUSTA_COOKIE_BEARER", "mixed-private-bearer"),
+            ("RUSTA_COOKIE_KEY", "mixed-private-key"),
+        ],
+        true,
+    );
+    assert_exit(&output, true);
+    let requests = server.finish();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]
+            .headers
+            .iter()
+            .filter(|(name, _)| name == "cookie")
+            .count(),
+        1
+    );
+    assert!(has_header(&requests[0], "cookie", &expected));
+    assert!(has_header(
+        &requests[0],
+        "authorization",
+        "Bearer mixed-private-bearer"
+    ));
+    assert!(has_header(&requests[0], "x-api-key", "mixed-private-key"));
+    assert_redacted(
+        &output,
+        Path::new(&directory.path("result.json")),
+        &[
+            first,
+            session,
+            "case-private-cookie",
+            "mixed-private-bearer",
+            "mixed-private-key",
+        ],
+    );
+}
+
+#[test]
+fn cookie_bindings_preflight_every_selected_case_before_any_traffic() {
+    for (binding, secret) in [
+        (None, None),
+        (Some("session=RUSTA_SUITE_MISSING_AUTH_TOKEN"), None),
+        (Some("session=RUSTA_COOKIE_INVALID"), Some("")),
+        (Some("session=RUSTA_COOKIE_INVALID"), Some("private secret")),
+        (Some("session=RUSTA_COOKIE_INVALID"), Some("private;secret")),
+        (Some("session=RUSTA_COOKIE_INVALID"), Some("private,secret")),
+        (
+            Some("session=RUSTA_COOKIE_INVALID"),
+            Some("private\"secret"),
+        ),
+        (
+            Some("session=RUSTA_COOKIE_INVALID"),
+            Some("private\\secret"),
+        ),
+        (
+            Some("session=RUSTA_COOKIE_INVALID"),
+            Some("private\nsecret"),
+        ),
+        (
+            Some("session=RUSTA_COOKIE_INVALID"),
+            Some("private\rsecret"),
+        ),
+        (
+            Some("session=RUSTA_COOKIE_INVALID"),
+            Some("private\tsecret"),
+        ),
+        (
+            Some("session=RUSTA_COOKIE_INVALID"),
+            Some("private\u{7f}secret"),
+        ),
+        (Some("session=RUSTA_COOKIE_INVALID"), Some("private☃secret")),
+    ] {
+        let directory = TempDir::new();
+        let mut spec = cookie_contract(json!([]));
+        spec["paths"]["/protected"] = spec["paths"]["/health"].clone();
+        spec["paths"]["/protected"]["get"]["operationId"] = json!("protected");
+        spec["paths"]["/protected"]["get"]["security"] = json!([{"session":[]}]);
+        let suite = directory.generate(&spec);
+        let server = Server::start(|_| Response::json(200, json!({"status":"ok"})));
+        let bindings: Vec<_> = binding.into_iter().collect();
+        let environment: Vec<_> = secret
+            .map(|value| ("RUSTA_COOKIE_INVALID", value))
+            .into_iter()
+            .collect();
+        let output = run_cookie_suite(
+            &directory,
+            &suite,
+            &server,
+            &["health", "protected"],
+            &bindings,
+            &environment,
+            true,
+        );
+        assert_cookie_preflight_refused(&directory, &output, &["private"]);
+        assert!(
+            server.finish().is_empty(),
+            "even the ready public case must wait for all preflight checks"
+        );
+    }
+}
+
+#[test]
+fn cookie_preview_does_not_resolve_environment_or_send_requests() {
+    for (binding, environment) in [
+        ("session=RUSTA_SUITE_MISSING_AUTH_TOKEN", vec![]),
+        (
+            "session=RUSTA_COOKIE_PREVIEW",
+            vec![("RUSTA_COOKIE_PREVIEW", "")],
+        ),
+        (
+            "session=RUSTA_COOKIE_PREVIEW",
+            vec![("RUSTA_COOKIE_PREVIEW", "malformed;preview-private\nvalue")],
+        ),
+    ] {
+        let directory = TempDir::new();
+        let suite = directory.generate(&cookie_contract(json!([{"session":[]}])));
+        let server = Server::start(|_| Response::json(200, json!({"status":"ok"})));
+        let output = run_cookie_suite(
+            &directory,
+            &suite,
+            &server,
+            &["health"],
+            &[binding],
+            &environment,
+            false,
+        );
+        assert_exit(&output, true);
+        let report = directory.read_json("result.json");
+        assert_eq!(report["ready"], true);
+        assert_eq!(report["executed"], false);
+        assert_eq!(report["passed"], Value::Null);
+        assert_eq!(report["cases"][0]["state"], "ready");
+        assert!(server.finish().is_empty());
+        assert_redacted(
+            &output,
+            Path::new(&directory.path("result.json")),
+            &[
+                "preview-private",
+                "RUSTA_COOKIE_PREVIEW",
+                "RUSTA_SUITE_MISSING_AUTH_TOKEN",
+            ],
+        );
+    }
+}
+
+#[test]
+fn malformed_cookie_names_are_blocked_in_generation_preview_and_execution() {
+    for name in [
+        "",
+        "white space",
+        "session=other",
+        "session;other",
+        "session,other",
+        "session:other",
+        "session/other",
+        "session\\other",
+        "session\"other",
+        "session☃",
+        "session\tother",
+    ] {
+        let directory = TempDir::new();
+        let mut spec = cookie_contract(json!([{"session":[]}]));
+        spec["components"]["securitySchemes"]["session"]["name"] = json!(name);
+        let suite = directory.generate(&spec);
+        assert!(
+            !directory.read_json("suite.json")["cases"][0]["blockers"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let server = Server::start(|_| Response::json(200, json!({"status":"ok"})));
+        let preview = run(
+            &directory.0,
+            &[
+                "suite",
+                "run",
+                &suite,
+                "--base-url",
+                &server.url,
+                "--operation",
+                "health",
+                "--auth-env",
+                "session=RUSTA_SUITE_MISSING_AUTH_TOKEN",
+            ],
+        );
+        assert_exit(&preview, true);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&preview.stdout).unwrap()["ready"],
+            false
+        );
+        let output = run_cookie_suite(
+            &directory,
+            &suite,
+            &server,
+            &["health"],
+            &["session=RUSTA_COOKIE_NAME"],
+            &[("RUSTA_COOKIE_NAME", "name-private-cookie")],
+            true,
+        );
+        assert_cookie_preflight_refused(&directory, &output, &["name-private-cookie"]);
+        assert!(server.finish().is_empty());
+    }
+}
+
+#[test]
+fn conflicting_cookie_schemes_and_reserved_parameters_fail_before_traffic() {
+    for conflict in [
+        "same_cookie_name",
+        "cookie_header_before",
+        "cookie_header_after",
+        "cookie_parameter",
+        "header_parameter",
+        "duplicate_binding",
+    ] {
+        let directory = TempDir::new();
+        let mut spec = cookie_contract(json!([{"session":[]}]));
+        match conflict {
+            "same_cookie_name" => {
+                spec["components"]["securitySchemes"]["second"] =
+                    spec["components"]["securitySchemes"]["session"].clone();
+                spec["security"] = json!([{"session":[], "second":[]}]);
+            }
+            "cookie_header_before" | "cookie_header_after" => {
+                let scheme = if conflict == "cookie_header_before" {
+                    "aHeader"
+                } else {
+                    "zHeader"
+                };
+                spec["components"]["securitySchemes"][scheme] =
+                    json!({"type":"apiKey", "in":"header", "name":"cOoKiE"});
+                spec["security"] = json!([{"session":[], scheme:[]}]);
+            }
+            "cookie_parameter" | "header_parameter" => {
+                spec["paths"]["/health"]["get"]["parameters"] = json!([{
+                    "name":if conflict == "cookie_parameter" { "session_id" } else { "Cookie" },
+                    "in":if conflict == "cookie_parameter" { "cookie" } else { "header" },
+                    "required":true, "schema":{"type":"string", "example":"parameter-private-cookie"}
+                }]);
+            }
+            "duplicate_binding" => {}
+            _ => unreachable!(),
+        }
+        let suite = directory.generate(&spec);
+        let server = Server::start(|_| Response::json(200, json!({"status":"ok"})));
+        let mut bindings = vec![
+            "session=RUSTA_COOKIE_CONFLICT",
+            "second=RUSTA_COOKIE_CONFLICT",
+            "aHeader=RUSTA_COOKIE_CONFLICT",
+            "zHeader=RUSTA_COOKIE_CONFLICT",
+        ];
+        if conflict == "duplicate_binding" {
+            bindings.push("session=RUSTA_COOKIE_CONFLICT");
+        }
+        if conflict != "duplicate_binding" {
+            let mut args = vec![
+                "suite",
+                "run",
+                &suite,
+                "--base-url",
+                &server.url,
+                "--operation",
+                "health",
+            ];
+            for binding in &bindings {
+                args.extend(["--auth-env", binding]);
+            }
+            let preview = run(&directory.0, &args);
+            assert_exit(&preview, true);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&preview.stdout).unwrap()["ready"],
+                false
+            );
+        }
+        // An equal value does not make two declarations for the same cookie unambiguous.
+        let output = run_cookie_suite(
+            &directory,
+            &suite,
+            &server,
+            &["health"],
+            &bindings,
+            &[("RUSTA_COOKIE_CONFLICT", "conflict-private-cookie")],
+            true,
+        );
+        assert_cookie_preflight_refused(&directory, &output, &["conflict-private-cookie"]);
+        assert!(server.finish().is_empty());
+    }
+}
+
+#[test]
+fn cookie_security_alternatives_fall_back_without_partial_credentials() {
+    for (requirements, bindings, environment, expected_header) in [
+        (
+            json!([{"session":[], "apiKey":[]}, {"bearer":[]}]),
+            vec![
+                "session=RUSTA_COOKIE_OR",
+                "apiKey=RUSTA_SUITE_MISSING_AUTH_TOKEN",
+                "bearer=RUSTA_COOKIE_OR_BEARER",
+            ],
+            vec![
+                ("RUSTA_COOKIE_OR", "unused-private-cookie"),
+                ("RUSTA_COOKIE_OR_BEARER", "fallback-private-bearer"),
+            ],
+            "authorization",
+        ),
+        (
+            json!([{"session":[]}, {"apiKey":[]}]),
+            vec!["session=RUSTA_COOKIE_OR", "apiKey=RUSTA_COOKIE_OR_KEY"],
+            vec![
+                ("RUSTA_COOKIE_OR", "malformed;private-cookie"),
+                ("RUSTA_COOKIE_OR_KEY", "fallback-private-key"),
+            ],
+            "x-api-key",
+        ),
+        (
+            json!([{"bearer":[]}, {"session":[]}]),
+            vec![
+                "bearer=RUSTA_SUITE_MISSING_AUTH_TOKEN",
+                "session=RUSTA_COOKIE_OR",
+            ],
+            vec![("RUSTA_COOKIE_OR", "fallback-private-cookie")],
+            "cookie",
+        ),
+        (
+            json!([{"session":[]}, {}]),
+            vec!["session=RUSTA_SUITE_MISSING_AUTH_TOKEN"],
+            vec![],
+            "none",
+        ),
+        (
+            json!([{"session":[], "secondSession":[]}, {"apiKey":[]}]),
+            vec![
+                "session=RUSTA_COOKIE_OR",
+                "secondSession=RUSTA_COOKIE_OR",
+                "apiKey=RUSTA_COOKIE_OR_KEY",
+            ],
+            vec![
+                ("RUSTA_COOKIE_OR", "unused-private-cookie"),
+                ("RUSTA_COOKIE_OR_KEY", "fallback-private-key"),
+            ],
+            "x-api-key",
+        ),
+    ] {
+        let directory = TempDir::new();
+        let mut spec = cookie_contract(requirements);
+        spec["components"]["securitySchemes"]["secondSession"] =
+            spec["components"]["securitySchemes"]["session"].clone();
+        let suite = directory.generate(&spec);
+        let server = Server::start(|_| Response::json(200, json!({"status":"ok"})));
+        let output = run_cookie_suite(
+            &directory,
+            &suite,
+            &server,
+            &["health"],
+            &bindings,
+            &environment,
+            true,
+        );
+        assert_exit(&output, true);
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        for header in ["cookie", "authorization", "x-api-key"] {
+            assert_eq!(
+                requests[0].headers.iter().any(|(name, _)| name == header),
+                header == expected_header
+            );
+        }
+        if expected_header == "cookie" {
+            assert!(has_header(
+                &requests[0],
+                "cookie",
+                "session_id=fallback-private-cookie"
+            ));
+        }
+        assert_redacted(
+            &output,
+            Path::new(&directory.path("result.json")),
+            &[
+                "unused-private-cookie",
+                "fallback-private-bearer",
+                "malformed;private-cookie",
+                "fallback-private-key",
+                "fallback-private-cookie",
+            ],
+        );
+    }
+}
+
+#[test]
+fn cookie_environment_names_are_validated_without_echoing_them_or_loading_secrets() {
+    for variable in [
+        "7_PRIVATE_NAME".to_owned(),
+        "PRIVATE-NAME".to_owned(),
+        "PRIVATE NAME".to_owned(),
+        "PRIVATE=NAME".to_owned(),
+        "PRIVATE☃NAME".to_owned(),
+        "PRIVATE_NAME".repeat(24),
+    ] {
+        let directory = TempDir::new();
+        let suite = directory.generate(&cookie_contract(json!([{"session":[]}])));
+        let server = Server::start(|_| Response::json(200, json!({"status":"ok"})));
+        let binding = format!("session={variable}");
+        let preview = run(
+            &directory.0,
+            &[
+                "suite",
+                "run",
+                &suite,
+                "--base-url",
+                &server.url,
+                "--operation",
+                "health",
+                "--auth-env",
+                &binding,
+            ],
+        );
+        assert_exit(&preview, true);
+        let report: Value = serde_json::from_slice(&preview.stdout).unwrap();
+        assert_eq!(report["ready"], false);
+        assert!(!String::from_utf8_lossy(&preview.stdout).contains(&variable));
+        assert!(!String::from_utf8_lossy(&preview.stderr).contains(&variable));
+        let output = run_cookie_suite(
+            &directory,
+            &suite,
+            &server,
+            &["health"],
+            &[&binding],
+            &[],
+            true,
+        );
+        assert_cookie_preflight_refused(&directory, &output, &[&variable]);
+        assert!(server.finish().is_empty());
+    }
+    // The inclusive boundary accepts an unset name in preview without resolving it.
+    let directory = TempDir::new();
+    let suite = directory.generate(&cookie_contract(json!([{"session":[]}])));
+    let server = Server::start(|_| Response::json(200, json!({"status":"ok"})));
+    let binding = format!("session={}", "A".repeat(256));
+    let output = run_cookie_suite(
+        &directory,
+        &suite,
+        &server,
+        &["health"],
+        &[&binding],
+        &[],
+        false,
+    );
+    assert_exit(&output, true);
+    assert_eq!(directory.read_json("result.json")["ready"], true);
+    assert!(server.finish().is_empty());
+}
+
+#[test]
+fn cookie_and_requirement_needs_both_cookie_and_header_credentials_before_traffic() {
+    for (bindings, environment) in [
+        (
+            vec!["apiKey=RUSTA_COOKIE_AND_KEY"],
+            vec![("RUSTA_COOKIE_AND_KEY", "and-private-key")],
+        ),
+        (
+            vec![
+                "session=RUSTA_SUITE_MISSING_AUTH_TOKEN",
+                "apiKey=RUSTA_COOKIE_AND_KEY",
+            ],
+            vec![("RUSTA_COOKIE_AND_KEY", "and-private-key")],
+        ),
+        (
+            vec![
+                "session=RUSTA_COOKIE_AND_SESSION",
+                "apiKey=RUSTA_SUITE_MISSING_AUTH_TOKEN",
+            ],
+            vec![("RUSTA_COOKIE_AND_SESSION", "and-private-cookie")],
+        ),
+    ] {
+        let directory = TempDir::new();
+        let suite = directory.generate(&cookie_contract(json!([{"session":[], "apiKey":[]}])));
+        let server = Server::start(|_| Response::json(200, json!({"status":"ok"})));
+        let output = run_cookie_suite(
+            &directory,
+            &suite,
+            &server,
+            &["health"],
+            &bindings,
+            &environment,
+            true,
+        );
+        assert_cookie_preflight_refused(
+            &directory,
+            &output,
+            &["and-private-key", "and-private-cookie"],
+        );
+        assert!(server.finish().is_empty());
+    }
+}
+
+#[test]
+fn fixture_helpers_confine_private_inputs_and_refuse_clobbering_or_traversal() {
+    let directory = TempDir::new();
+    let original = directory.write("input.json", b"{\"synthetic\":true}");
+    assert!(std::panic::catch_unwind(|| directory.write("input.json", b"replacement")).is_err());
+    assert_eq!(fs::read(&original).unwrap(), b"{\"synthetic\":true}");
+    assert_eq!(directory.read_json("input.json"), json!({"synthetic":true}));
+    for name in [
+        "",
+        ".",
+        "..",
+        "../outside.json",
+        "sub/file.json",
+        "sub\\file.json",
+        "/absolute.json",
+        "C:\\absolute.json",
+    ] {
+        assert!(std::panic::catch_unwind(|| directory.path(name)).is_err());
+        assert!(std::panic::catch_unwind(|| directory.write(name, b"unexpected")).is_err());
+        assert!(std::panic::catch_unwind(|| directory.read_json(name)).is_err());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        assert_eq!(
+            fs::metadata(&directory.0).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&original).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let missing = directory.fixture_path("missing.json");
+        let link = directory.fixture_path("result.json");
+        symlink(&missing, &link).unwrap();
+        assert!(
+            std::panic::catch_unwind(|| directory.write("result.json", b"unexpected")).is_err()
+        );
+        assert!(
+            matches!(fs::symlink_metadata(&missing), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        );
+        let failure = run(&directory.0, &["--not-a-real-option"]);
+        assert_exit(&failure, false);
+        // A dangling symlink is still an output artifact, not an absent report.
+        assert!(
+            std::panic::catch_unwind(|| assert_cookie_preflight_refused(&directory, &failure, &[]))
+                .is_err()
+        );
     }
 }
