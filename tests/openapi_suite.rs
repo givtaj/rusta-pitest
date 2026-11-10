@@ -19,27 +19,83 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "rusta-pitest-openapi-{}-{}",
+        // Keep fixtures below the build checkout instead of trusting runtime TMPDIR.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("openapi-test-fixtures");
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.recursive(true).create(&root).unwrap();
+        let metadata = fs::symlink_metadata(&root).unwrap();
+        assert!(
+            metadata.is_dir(),
+            "test fixture root must be a real directory"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Trust the checkout, but refuse writable parents that permit another
+            // user to replace the private fixture directories. Never chmod them.
+            let target = fs::metadata(root.parent().unwrap()).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o022, 0);
+            assert_eq!(target.permissions().mode() & 0o022, 0);
+        }
+        let root = root.canonicalize().unwrap();
+        let path = root.join(format!(
+            "{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir(&path).unwrap();
+        // Exclusive creation refuses pre-existing directories or symlinks.
+        builder.recursive(false).create(&path).unwrap();
+        let path = path.canonicalize().unwrap();
+        if !path.starts_with(&root) || path.parent() != Some(root.as_path()) {
+            panic!("test fixture directory escaped its root");
+        }
         Self(path)
     }
 
+    fn fixture_path(&self, name: &str) -> PathBuf {
+        // Only closed, portable leaf names are accepted; no absolute or nested paths.
+        assert!(
+            !name.is_empty()
+                && name != "."
+                && !name.contains("..")
+                && name.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+                }),
+            "invalid test fixture leaf name"
+        );
+        self.0.join(name)
+    }
+
     fn write(&self, name: &str, bytes: impl AsRef<[u8]>) -> String {
-        let path = self.0.join(name);
-        fs::write(&path, bytes).unwrap();
+        let path = self.fixture_path(name);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(&path)
+            .unwrap()
+            .write_all(bytes.as_ref())
+            .unwrap();
         path.to_str().unwrap().to_owned()
     }
 
     fn path(&self, name: &str) -> String {
-        self.0.join(name).to_str().unwrap().to_owned()
+        self.fixture_path(name).to_str().unwrap().to_owned()
     }
 
     fn read_json(&self, name: &str) -> Value {
-        serde_json::from_slice(&fs::read(self.0.join(name)).unwrap()).unwrap()
+        serde_json::from_slice(&fs::read(self.fixture_path(name)).unwrap()).unwrap()
     }
 
     fn generate(&self, contract: &Value) -> String {
@@ -1370,7 +1426,10 @@ fn run_cookie_suite(
 
 fn assert_cookie_preflight_refused(directory: &TempDir, output: &Output, secrets: &[&str]) {
     assert_exit(output, false);
-    assert!(!Path::new(&directory.path("result.json")).exists());
+    assert!(matches!(
+        fs::symlink_metadata(directory.fixture_path("result.json")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ));
     let diagnostics = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -2044,5 +2103,56 @@ fn cookie_and_requirement_needs_both_cookie_and_header_credentials_before_traffi
             &["and-private-key", "and-private-cookie"],
         );
         assert!(server.finish().is_empty());
+    }
+}
+
+#[test]
+fn fixture_helpers_confine_private_inputs_and_refuse_clobbering_or_traversal() {
+    let directory = TempDir::new();
+    let original = directory.write("input.json", b"{\"synthetic\":true}");
+    assert!(std::panic::catch_unwind(|| directory.write("input.json", b"replacement")).is_err());
+    assert_eq!(fs::read(&original).unwrap(), b"{\"synthetic\":true}");
+    assert_eq!(directory.read_json("input.json"), json!({"synthetic":true}));
+    for name in [
+        "",
+        ".",
+        "..",
+        "../outside.json",
+        "sub/file.json",
+        "sub\\file.json",
+        "/absolute.json",
+        "C:\\absolute.json",
+    ] {
+        assert!(std::panic::catch_unwind(|| directory.path(name)).is_err());
+        assert!(std::panic::catch_unwind(|| directory.write(name, b"unexpected")).is_err());
+        assert!(std::panic::catch_unwind(|| directory.read_json(name)).is_err());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        assert_eq!(
+            fs::metadata(&directory.0).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&original).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let missing = directory.fixture_path("missing.json");
+        let link = directory.fixture_path("result.json");
+        symlink(&missing, &link).unwrap();
+        assert!(
+            std::panic::catch_unwind(|| directory.write("result.json", b"unexpected")).is_err()
+        );
+        assert!(
+            matches!(fs::symlink_metadata(&missing), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        );
+        let failure = run(&directory.0, &["--not-a-real-option"]);
+        assert_exit(&failure, false);
+        // A dangling symlink is still an output artifact, not an absent report.
+        assert!(
+            std::panic::catch_unwind(|| assert_cookie_preflight_refused(&directory, &failure, &[]))
+                .is_err()
+        );
     }
 }
