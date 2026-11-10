@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add bounded, ordered literal query pairs to authored workloads, preserving
+  repeated names and empty values with exact UTF-8 percent encoding.
+- Reject malformed or oversized queries before setup or measured traffic and
+  omit query names/values from reports and diagnostics. Existing plans and
+  workload/report versions remain unchanged.
 - Bind declared OpenAPI cookie security schemes privately through `--auth-env`,
   preserving selected GET/HEAD execution and security alternatives/combinations.
 - Validate cookie names and opaque values before traffic, reject conflicting

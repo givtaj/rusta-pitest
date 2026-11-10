@@ -3,7 +3,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{
         Arc, Mutex,
@@ -19,20 +19,43 @@ struct Temp(PathBuf);
 impl Temp {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "rusta-workload-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        // Runtime TMPDIR cannot redirect synthetic fixture paths.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("workload-test-fixtures");
         let mut directory = fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
             directory.mode(0o700);
         }
-        // create is atomic and refuses pre-existing paths; private permissions
-        // protect intentional fixture rewrites inside this owned directory.
-        directory.create(&path).unwrap();
+        directory.recursive(true).create(&root).unwrap();
+        let metadata = fs::symlink_metadata(&root).unwrap();
+        assert!(
+            metadata.is_dir(),
+            "test fixture root must be a real directory"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Refuse parents that let another user replace private fixtures.
+            // Existing directories are checked, never chmodded by the tests.
+            let target = fs::metadata(root.parent().unwrap()).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o022, 0);
+            assert_eq!(target.permissions().mode() & 0o022, 0);
+        }
+        let root = root.canonicalize().unwrap();
+        let path = root.join(format!(
+            "{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        // Atomic creation refuses pre-existing paths, including symlinks.
+        directory.recursive(false).create(&path).unwrap();
+        let path = path.canonicalize().unwrap();
+        if !path.starts_with(&root) || path.parent() != Some(root.as_path()) {
+            panic!("test fixture directory escaped its root");
+        }
         Self(path)
     }
     fn plan(&self, value: &Value) -> PathBuf {
@@ -143,9 +166,13 @@ fn serve(mut stream: TcpStream, requests: Arc<Mutex<Vec<Request>>>) {
         headers,
         body,
     });
-    let status = if path.ends_with("/denied") {
+    let route = path.split('?').next().unwrap();
+    if route.ends_with("/disconnect") {
+        return;
+    }
+    let status = if route.ends_with("/denied") {
         401
-    } else if path.ends_with("/failure") {
+    } else if route.ends_with("/failure") {
         503
     } else {
         200
@@ -153,7 +180,7 @@ fn serve(mut stream: TcpStream, requests: Arc<Mutex<Vec<Request>>>) {
     let body = br#"{"ok":true}"#;
     if write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).is_err() { return; }
     let _ = stream.flush();
-    if path.ends_with("/slow") || path.ends_with("/write") {
+    if route.ends_with("/slow") || route.ends_with("/write") {
         thread::sleep(Duration::from_millis(250));
     }
     if method != "HEAD" {
@@ -260,6 +287,8 @@ fn actors_are_isolated_expected_denials_pass_and_secrets_are_redacted() {
     p["groups"]["load"] =
         json!({"actors":["a","b"],"max_in_flight":2,"requests":["read","denied"]});
     p["max_in_flight"] = json!(2);
+    p["requests"]["read"]["query"] = json!([{"name":"scope","value":"actor-private+scope"}]);
+    p["requests"]["denied"]["query"] = json!([{"name":"scope","value":"actor-private+scope"}]);
     p["phases"][0]["duration_ms"] = json!(400);
     let output = command(&temp, &p, Some(&server))
         .env("RUSTA_COOKIE_A", "session=actor-A-secret")
@@ -273,6 +302,8 @@ fn actors_are_isolated_expected_denials_pass_and_secrets_are_redacted() {
         "actor-B-secret",
         "csrf-A-secret",
         "csrf-B-secret",
+        "actor-private+scope",
+        "actor-private%2Bscope",
     ] {
         assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
         assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
@@ -290,6 +321,7 @@ fn actors_are_isolated_expected_denials_pass_and_secrets_are_redacted() {
             format!("session=actor-{actor}-secret")
         );
         assert_eq!(request.headers["x-csrf"], format!("csrf-{actor}-secret"));
+        assert!(request.path.ends_with("?scope=actor-private%2Bscope"));
     }
 }
 
@@ -330,8 +362,20 @@ fn deliberate_write_replay_preserves_bytes_key_and_drains_admitted_sequence() {
     fs::write(temp.0.join("body.json"), bytes).unwrap();
     p["requests"] = json!({"write":{"method":"POST","path":"/write","body_file":"body.json","content_type":"application/json","idempotency_key_env":"RUSTA_TEST_KEY"},"setup":{"method":"GET","path":"/setup"}});
     p["setup"] = json!([{"actor":"a","request":"setup"}]);
+    p["requests"]["write"]["query"] =
+        json!([{"name":"intent","value":"same+intent"},{"name":"intent","value":""}]);
+    p["requests"]["setup"]["query"] = json!([{"name":"phase","value":"setup only"}]);
     p["groups"]["load"] = json!({"actors":["a"],"max_in_flight":1,"sequence":[{"request":"write"},{"request":"write","replay_of":0}]});
     p["phases"][0]["rates"]["load"] = json!(1);
+    let refused = command(&temp, &p, Some(&server))
+        .env("RUSTA_TEST_KEY", "synthetic-idempotency-secret")
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(
+        server.seen().is_empty(),
+        "write opt-in must precede even setup traffic"
+    );
     let output = command(&temp, &p, Some(&server))
         .arg("--allow-writes")
         .env("RUSTA_TEST_KEY", "synthetic-idempotency-secret")
@@ -348,9 +392,10 @@ fn deliberate_write_replay_preserves_bytes_key_and_drains_admitted_sequence() {
     assert_eq!(r["sequence_counts"]["passed"], 1);
     let seen = server.seen();
     assert_eq!(seen.len(), 3);
-    assert_eq!(seen[0].path, "/setup");
+    assert_eq!(seen[0].path, "/setup?phase=setup%20only");
     for request in &seen[1..] {
         assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/write?intent=same%2Bintent&intent=");
         assert_eq!(request.body, bytes);
         assert_eq!(
             request.headers["idempotency-key"],
@@ -508,4 +553,334 @@ fn interruption_publishes_complete_accounting_and_incomplete_capture() {
     assert_eq!(r["counts"]["offered"], 600);
     assert_eq!(r["evidence"]["complete"], false);
     assert_eq!(r["counts"]["cancelled"], 1);
+}
+
+fn plan_with_later_query(query: Value) -> Value {
+    let mut p = plan();
+    p["requests"]["z_later"] = json!({"method":"GET","path":"/later","query":query});
+    p["setup"] = json!([{"actor":"a","request":"read"}]);
+    p["groups"]["load"]["requests"] = json!(["read", "z_later"]);
+    p
+}
+
+#[test]
+fn query_pairs_preserve_wire_order_repeats_empty_values_and_encode_utf8_once() {
+    let temp = Temp::new();
+    let server = Server::new();
+    let mut p = plan();
+    p["requests"]["read"]["query"] = json!([
+        {"name":"tag","value":"first"},
+        {"name":"tag","value":"second"},
+        {"name":"empty","value":""},
+        {"name":"na me+☃","value":"space +/%?#=&;☃\n\u{0}"},
+        {"name":"unreserved-._~","value":"AZaz09-._~"},
+        {"name":"literal","value":"${RUSTA_QUERY_LITERAL}"}
+    ]);
+    let path = temp.plan(&p);
+    let output = Command::new(env!("CARGO_BIN_EXE_rusta-pitest"))
+        .current_dir(&temp.0)
+        .args(["workload", "run"])
+        .arg(path)
+        .args([
+            "--execute",
+            "--base-url",
+            &format!("{}/base/prefix/", server.url),
+            "--operation",
+            "read",
+        ])
+        .env("RUSTA_QUERY_LITERAL", "must-not-be-interpolated-private")
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("must-not-be-interpolated-private"));
+    let r = report(output, true);
+    reconcile(&r);
+    assert_eq!(r["schema_version"], 2);
+    assert_eq!(r["counts"]["passed"], 1);
+    let seen = server.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        seen[0].path,
+        "/base/prefix/ok?tag=first&tag=second&empty=&na%20me%2B%E2%98%83=space%20%2B%2F%25%3F%23%3D%26%3B%E2%98%83%0A%00&unreserved-._~=AZaz09-._~&literal=%24%7BRUSTA_QUERY_LITERAL%7D"
+    );
+}
+
+#[test]
+fn omitted_or_empty_query_retains_the_original_request_target() {
+    for query in [None, Some(json!([]))] {
+        let temp = Temp::new();
+        let server = Server::new();
+        let mut p = plan();
+        if let Some(query) = query {
+            p["requests"]["read"]["query"] = query;
+        }
+        let r = report(command(&temp, &p, Some(&server)).output().unwrap(), true);
+        reconcile(&r);
+        assert_eq!(server.seen()[0].path, "/ok");
+    }
+}
+
+#[test]
+fn invalid_query_shapes_types_and_limits_fail_before_setup_or_measured_traffic() {
+    let invalid = vec![
+        Value::Null,
+        json!({"name":"q","value":"private-query"}),
+        json!("private-query"),
+        json!([null]),
+        json!([["q", "private-query"]]),
+        json!([["q", "private-query", "extra"]]),
+        json!([[]]),
+        json!([[{"name":"q","value":"private-query"}]]),
+        json!([{"name":"","value":"private-query"}]),
+        json!([{"name":null,"value":"private-query"}]),
+        json!([{"name":7,"value":"private-query"}]),
+        json!([{"name":"q","value":null}]),
+        json!([{"name":"q","value":7}]),
+        json!([{"name":"q","value":false}]),
+        json!([{"name":"q","value":["private-query"]}]),
+        json!([{"name":"q","value":{"env":"RUSTA_QUERY_PRIVATE"}}]),
+        json!([{"name":"q"}]),
+        json!([{"value":"private-query"}]),
+        json!([{"name":"q","value":"private-query","extra":"private-query"}]),
+        json!([{"name":"q","value_env":"RUSTA_QUERY_PRIVATE"}]),
+        json!([{"name":"é".to_owned()+&"n".repeat(127),"value":"private-query"}]),
+        json!([{"name":"q","value":"é".to_owned()+&"v".repeat(4095)}]),
+        Value::Array(vec![json!({"name":"q","value":"private-query"}); 33]),
+        json!([{"name":"a","value":"x".repeat(4096)},{"name":"b","value":"x".repeat(4092)}]),
+        json!([{"name":"q","value":"☃".repeat(1000)}]),
+    ];
+    for query in invalid {
+        let temp = Temp::new();
+        let server = Server::new();
+        let p = plan_with_later_query(query);
+        for execute in [false, true] {
+            let output = command(&temp, &p, execute.then_some(&server))
+                .env("RUSTA_QUERY_PRIVATE", "private-environment-value")
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "invalid query must fail before execution"
+            );
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("private-query"));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("private-query"));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("private-environment-value"));
+            assert!(
+                server.seen().is_empty(),
+                "a valid setup/earlier request must wait for the entire plan"
+            );
+        }
+    }
+}
+
+#[test]
+fn query_pair_byte_count_and_serialized_size_limits_are_inclusive() {
+    for (query, expected_query_bytes) in [
+        (
+            json!([{"name":"é".to_owned()+&"n".repeat(126),"value":""}]),
+            133,
+        ),
+        (
+            json!([{"name":"q","value":"é".to_owned()+&"v".repeat(4094)}]),
+            4102,
+        ),
+        (Value::Array(vec![json!({"name":"a","value":""}); 32]), 95),
+        (
+            json!([{"name":"a","value":"x".repeat(4096)},{"name":"b","value":"x".repeat(4091)}]),
+            8192,
+        ),
+    ] {
+        let temp = Temp::new();
+        let server = Server::new();
+        let mut p = plan();
+        p["requests"]["read"]["query"] = query;
+        let r = report(command(&temp, &p, Some(&server)).output().unwrap(), true);
+        reconcile(&r);
+        let seen = server.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].path.strip_prefix("/ok?").unwrap().len(),
+            expected_query_bytes
+        );
+    }
+}
+
+#[test]
+fn duplicate_query_keys_are_rejected_before_setup_or_measured_requests() {
+    for raw_query in [
+        r#"[{"name":"q","name":"other-private","value":"value-private"}]"#,
+        r#"[{"name":"q","value":"value-private","value":"other-private"}]"#,
+        r#"[],"query":[{"name":"q","value":"value-private"}]"#,
+    ] {
+        let temp = Temp::new();
+        let server = Server::new();
+        let p = plan_with_later_query(json!("QUERY_PLACEHOLDER"));
+        let raw = serde_json::to_string(&p)
+            .unwrap()
+            .replace("\"QUERY_PLACEHOLDER\"", raw_query);
+        let path = temp.0.join("plan.json");
+        fs::write(&path, raw).unwrap();
+        for execute in [false, true] {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_rusta-pitest"));
+            cmd.current_dir(&temp.0)
+                .args(["workload", "run"])
+                .arg(&path);
+            if execute {
+                cmd.args([
+                    "--execute",
+                    "--base-url",
+                    &server.url,
+                    "--operation",
+                    "read",
+                    "--operation",
+                    "z_later",
+                ]);
+            }
+            let output = cmd.output().unwrap();
+            assert!(!output.status.success());
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("value-private"));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("other-private"));
+            assert!(server.seen().is_empty());
+        }
+    }
+}
+
+#[test]
+fn query_preview_resolves_neither_credentials_nor_environment_interpolation() {
+    let temp = Temp::new();
+    let server = Server::new();
+    let mut p = plan();
+    p["actors"]["a"] = json!({"headers_env":{"Cookie":"RUSTA_QUERY_MISSING_COOKIE"}});
+    p["requests"]["read"]["query"] =
+        json!([{"name":"preview-private+name","value":"${RUSTA_QUERY_VALUE}"}]);
+    let output = command(&temp, &p, None)
+        .args([
+            "--base-url",
+            &server.url,
+            "--operation",
+            "read",
+            "--output",
+            "preview.json",
+        ])
+        .env_remove("RUSTA_QUERY_MISSING_COOKIE")
+        .env("RUSTA_QUERY_VALUE", "preview-environment-private")
+        .output()
+        .unwrap();
+    let saved = fs::read_to_string(temp.0.join("preview.json")).unwrap();
+    for text in [
+        String::from_utf8_lossy(&output.stdout).as_ref(),
+        String::from_utf8_lossy(&output.stderr).as_ref(),
+        saved.as_str(),
+    ] {
+        for secret in [
+            "preview-private+name",
+            "preview-private%2Bname",
+            "${RUSTA_QUERY_VALUE}",
+            "%24%7BRUSTA_QUERY_VALUE%7D",
+            "preview-environment-private",
+        ] {
+            assert!(!text.contains(secret));
+        }
+    }
+    let r = report(output, true);
+    assert_eq!(r["executed"], false);
+    assert_eq!(r["runtime_secrets_loaded"], false);
+    assert_eq!(r["schema_version"], 2);
+    assert!(server.seen().is_empty());
+}
+
+#[test]
+fn query_values_are_redacted_from_success_denial_transport_reports_and_evidence() {
+    for (path, expected, success) in [
+        ("/ok", None, true),
+        ("/denied", Some(401), true),
+        ("/denied", None, false),
+        ("/disconnect", None, false),
+    ] {
+        let temp = Temp::new();
+        let server = Server::new();
+        let mut p = plan();
+        p["requests"]["read"]["path"] = json!(path);
+        p["requests"]["read"]["query"] = json!([{"name":"private+name","value":"private+query/☃"}]);
+        if let Some(expected) = expected {
+            p["requests"]["read"]["expect_status"] = json!(expected);
+        }
+        let output = command(&temp, &p, Some(&server))
+            .args(["--output", "result.json"])
+            .output()
+            .unwrap();
+        let saved = fs::read_to_string(temp.0.join("result.json")).unwrap();
+        for text in [
+            String::from_utf8_lossy(&output.stdout).as_ref(),
+            String::from_utf8_lossy(&output.stderr).as_ref(),
+            saved.as_str(),
+        ] {
+            for secret in [
+                "private+name",
+                "private%2Bname",
+                "private+query/☃",
+                "private%2Bquery%2F%E2%98%83",
+            ] {
+                assert!(
+                    !text.contains(secret),
+                    "query material must not enter diagnostics or evidence"
+                );
+            }
+        }
+        let r = report(output, success);
+        reconcile(&r);
+        assert_eq!(r["schema_version"], 2);
+        assert_eq!(r["evidence"]["complete"], true);
+        assert_eq!(r["evidence"]["records"].as_array().unwrap().len(), 1);
+        let seen = server.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].path,
+            format!("{path}?private%2Bname=private%2Bquery%2F%E2%98%83")
+        );
+        assert_eq!(r["counts"]["passed"], u64::from(success));
+        assert_eq!(r["counts"]["failed"], u64::from(!success));
+    }
+}
+
+#[test]
+fn query_support_keeps_explicit_selection_and_raw_path_query_restrictions() {
+    let temp = Temp::new();
+    let server = Server::new();
+    let mut p = plan();
+    p["requests"]["read"]["query"] = json!([{"name":"q","value":"selected-private"}]);
+    let path = temp.plan(&p);
+    let no_selection = Command::new(env!("CARGO_BIN_EXE_rusta-pitest"))
+        .current_dir(&temp.0)
+        .args(["workload", "run"])
+        .arg(&path)
+        .args(["--execute", "--base-url", &server.url])
+        .output()
+        .unwrap();
+    assert!(!no_selection.status.success());
+    assert!(server.seen().is_empty());
+    p["requests"]["read"]["path"] = json!("/ok?embedded=private");
+    let invalid_path = command(&temp, &p, Some(&server)).output().unwrap();
+    assert!(!invalid_path.status.success());
+    assert!(server.seen().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn workload_fixtures_have_private_modes_and_protected_parents() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = Temp::new();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("workload-test-fixtures");
+    let metadata = fs::symlink_metadata(&root).unwrap();
+    assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+    assert_eq!(metadata.permissions().mode() & 0o022, 0);
+    let target = fs::metadata(root.parent().unwrap()).unwrap();
+    assert_eq!(target.permissions().mode() & 0o022, 0);
+    let root = root.canonicalize().unwrap();
+    assert_eq!(temp.0.parent(), Some(root.as_path()));
+    assert_eq!(
+        fs::metadata(&temp.0).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
 }

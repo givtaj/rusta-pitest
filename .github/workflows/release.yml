@@ -146,8 +146,11 @@ jobs:
           assert checksummed == {path.relative_to(unpacked / name).as_posix() for path in (unpacked / name).rglob('*') if path.is_file() and path != unpacked / name / 'SHA256SUMS'}
           required_files = [f'docs/releases/{os.environ["RELEASE_TAG"]}.md']
           has_workloads = Path('src/workload.rs').is_file()
+          has_workload_queries = Path('examples/workload-query.json').is_file()
           if has_workloads:
               required_files += ['docs/workloads.md', 'docs/openapi-suites.md', 'docs/json-reports.md', 'examples/workload.json', 'examples/widgets.openapi.yaml']
+          if has_workload_queries:
+              required_files.append('examples/workload-query.json')
           for required in required_files:
               assert (unpacked / name / required).is_file(), required
           subprocess.run(['python3', 'scripts/release-smoke.py', str(unpacked / name / 'rusta-pitest'), '--expected-version', provenance['version'], '--expected-revision', provenance['git_revision'], '--expected-target', provenance['target'], '--require-clean'], check=True)
@@ -156,6 +159,12 @@ jobs:
               assert preview['kind'] == 'workload' and preview['schema_version'] == 2
               assert preview['executed'] is False and preview['runtime_secrets_loaded'] is False
               assert preview['planned_requests'] == 32
+          if has_workload_queries:
+              query_preview = json.loads(subprocess.check_output([str((unpacked / name / 'rusta-pitest').resolve()), 'workload', 'run', str((unpacked / name / 'examples/workload-query.json').resolve())], text=True))
+              assert query_preview['kind'] == 'workload' and query_preview['schema_version'] == 2
+              assert query_preview['workload_version'] == 1
+              assert query_preview['executed'] is False and query_preview['runtime_secrets_loaded'] is False
+              assert query_preview['passed'] is None and query_preview['planned_requests'] == 1
           PY
 
       - name: Upload verified release artifacts

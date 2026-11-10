@@ -117,6 +117,13 @@ automatic authentication renewal. Execution requires `--execute`, an explicit
 See [workloads](docs/workloads.md) for a runnable localhost fixture, the complete
 plan, credential handling, sequence semantics, limits, and schema-v2 reports.
 
+**Unreleased:** authored requests can also supply ordered `query` name/value
+pairs, including repeated names, empty values, and Unicode. Values are literal
+plan data, with bounded percent encoding and no automatic pagination or
+environment interpolation. See [structured query parameters](docs/workloads.md#structured-query-parameters)
+and the [complete synthetic example](examples/workload-query.json). Published
+alpha.5 rejects this field.
+
 From alpha.4, OpenAPI commands also accept bounded larger inputs:
 `openapi generate --max-input-bytes` defaults to 1 MiB, its
 `--max-suite-bytes` defaults to 4 MiB, and `suite run --max-input-bytes`
