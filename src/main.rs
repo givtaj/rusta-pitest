@@ -2,6 +2,7 @@ mod bench;
 mod catalogue;
 mod cli;
 mod contract;
+mod cookie;
 mod model;
 mod openapi;
 mod output;

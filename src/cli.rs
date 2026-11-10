@@ -124,7 +124,7 @@ pub struct SuiteOptions {
     /// Bind a fixture slot: NAME=VALUE; values are not saved in reports
     #[arg(long = "fixture", value_parser = parse_assignment)]
     pub fixtures: Vec<(String, String)>,
-    /// Bind a security scheme to an environment variable: SCHEME=ENV_NAME
+    /// Bind bearer/header/cookie security to an environment variable: SCHEME=ENV_NAME
     #[arg(long = "auth-env", value_parser = parse_assignment)]
     pub auth_env: Vec<(String, String)>,
     /// Timeout through the full response body

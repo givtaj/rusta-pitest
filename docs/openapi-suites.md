@@ -4,6 +4,9 @@ Introduced in `v0.1.0-alpha.3`, this experimental feature generates reviewable
 contract suites and executes selected GET/HEAD cases. The existing SleepAPI
 profiles and benchmark report schema v1 remain supported.
 
+Cookie security bindings described below are **unreleased** and require a build
+containing that change; published alpha.5 supports bearer/header API keys only.
+
 ## Generate and review
 
 ```sh
@@ -99,13 +102,83 @@ primitives/arrays when the schema requires them. Other required parameters use
 bounded, schema-validated synthetic candidates; optional parameters are omitted
 unless a reviewed suite supplies a candidate or fixture binding.
 
-The supported authentication schemes are HTTP bearer and API keys in headers.
-Security alternatives and combined requirements are preserved. A complete
-alternative must be configured; unsupported schemes do not silently become
-anonymous requests. OAuth acquisition, session/cookie flows, and certificate
-setup are outside this MVP. Contract-fetch credentials are never forwarded.
-The separate [workload runner](workloads.md), introduced in alpha.4, supports static
-actor cookie/header bindings; it does not change generated-suite authentication.
+The supported authentication schemes are HTTP bearer and API keys in headers
+or cookies. Security alternatives (OR) and combined requirements (AND) are
+preserved. The runner uses the first complete, supported, valid alternative in
+contract order; every scheme in that alternative must be bound. Unsupported
+schemes do not silently become anonymous requests. Only the chosen alternative
+contributes credentials to its selected operation. Public and unselected
+operations do not acquire credentials from unrelated bindings.
+
+OAuth acquisition, login, session renewal, and certificate setup remain outside
+this feature. Contract-fetch credentials are never forwarded. The separate
+[workload runner](workloads.md) supports static actor cookie/header bindings;
+those bindings do not configure generated suites.
+
+### Private cookie bindings
+
+For a contract declaring a cookie security scheme:
+
+```yaml
+components:
+  securitySchemes:
+    session:
+      type: apiKey
+      in: cookie
+      name: session_id
+security:
+  - session: []
+```
+
+Obtain an authorized cookie value separately and place it in a private
+environment variable, then name that variable with the existing `--auth-env`
+option:
+
+```sh
+cargo run -- suite run /tmp/api.suite.json \
+  --base-url http://127.0.0.1:8080 \
+  --operation getProfile \
+  --auth-env session=TEST_SESSION_VALUE \
+  --execute --output /tmp/profile.report.json
+```
+
+`TEST_SESSION_VALUE` contains only the cookie value, not `session_id=value`, a
+`Cookie` header, or `Set-Cookie` attributes. The cookie name comes from the
+reviewed contract. Do not put a credential value on the command line or in the
+suite. Cookie environment-variable names must match
+`[A-Za-z_][A-Za-z0-9_]*` and be at most 256 ASCII characters. Cookie values are
+read only during execution preflight; preview validates
+the binding and declared name without reading the variable. A ready preview
+does not prove that a variable exists or contains a usable session.
+
+Cookie serialization follows the unquoted
+[RFC 6265 cookie grammar](https://www.rfc-editor.org/rfc/rfc6265.html#section-4.1.1):
+
+- Names must be nonempty ASCII HTTP tokens: letters, digits, and
+  `` ! # $ % & ' * + - . ^ _ ` | ~ ``.
+- Values must be nonempty, unquoted ASCII cookie values. Spaces, control bytes,
+  double quotes, commas, semicolons, backslashes, and non-ASCII characters are
+  rejected. Characters such as `=`, `%`, `+`, and `/` are preserved verbatim.
+- The runner does not trim, quote, percent-encode, or decode either field.
+  Multiple cookies in one AND requirement form one `Cookie` header, ordered
+  case-sensitively by cookie name and joined with `; `.
+- Two schemes using the same cookie name conflict even if their values match.
+  A cookie scheme combined with a header API key named `Cookie` also conflicts.
+  Ordinary cookie parameters and ordinary `Cookie` header parameters remain
+  unsupported.
+
+Missing, empty, malformed, or conflicting credentials that leave a selected
+operation without a valid security alternative block the entire run before
+operation traffic. No cookie jar is maintained: response `Set-Cookie` headers
+do not replace credentials or authenticate later operations. Authentication
+values and environment-variable binding names remain absent from reports and
+diagnostics.
+
+Existing suite/report formats remain version 1, and previously supported
+bearer/header API-key suites remain compatible. Regenerate older suites with
+stored unsupported-authentication blockers: their diagnostic text has changed,
+and validation compares stored blockers with the current importer. Editing those
+blockers by hand is not a migration mechanism.
 
 Execution checks every selected case before the first request. A missing
 fixture/credential, invalid header, unsupported schema, or blocked operation
@@ -140,6 +213,12 @@ Response checks include:
   absent headers do not fail. Content-Type comes from the response content map.
 - HEAD and bodyless statuses have no body-schema assertion. A 202 response
   checks only the immediate response, not eventual completion.
+
+A missing or revoked session returning 401, or a wrong-user session returning
+403, therefore fails a generated positive test even when that response is
+documented. To assert an intentional denial as a passing result, use a separately
+authored [workload expected-denial case](workloads.md); generated suites do not
+infer denial scenarios.
 
 JSON Schema Draft 2020-12 constraints and OpenAPI 3.1 annotations are preserved,
 including `$ref` siblings and productive recursive schemas. Only same-document

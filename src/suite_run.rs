@@ -422,6 +422,7 @@ fn authentication_alternative(
     execute: bool,
 ) -> Result<HeaderMap, String> {
     let mut headers = HeaderMap::new();
+    let mut cookies = BTreeMap::new();
     for name in alternative.keys() {
         let Some(definition) = suite
             .contract
@@ -435,6 +436,37 @@ fn authentication_alternative(
         let Some(variable) = bindings.get(name.as_str()) else {
             return Err("authentication_binding_required".into());
         };
+        if definition["type"] == "apiKey" && definition["in"] == "cookie" {
+            let cookie_name = definition["name"].as_str().unwrap_or("");
+            if !crate::cookie::valid_name(cookie_name) {
+                return Err("authentication_cookie_name_invalid".into());
+            }
+            let mut bytes = variable.bytes();
+            if variable.len() > 256
+                || !bytes
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                return Err("authentication_environment_name_invalid".into());
+            }
+            if cookies.contains_key(cookie_name) {
+                return Err("conflicting_authentication_cookies".into());
+            }
+            // Preview has the same name/conflict checks without reading secrets.
+            let value = if execute {
+                let secret =
+                    std::env::var(variable).map_err(|_| "authentication_environment_missing")?;
+                if !crate::cookie::valid_value(&secret) {
+                    return Err("authentication_cookie_value_invalid".into());
+                }
+                secret
+            } else {
+                "preview".to_owned()
+            };
+            cookies.insert(cookie_name.to_owned(), value);
+            continue;
+        }
         let header = match (
             definition["type"].as_str(),
             definition["scheme"].as_str(),
@@ -469,14 +501,31 @@ fn authentication_alternative(
             } else {
                 secret
             };
-            let value =
+            let mut value =
                 HeaderValue::from_str(&value).map_err(|_| "authentication_value_invalid")?;
+            value.set_sensitive(true);
             if headers.insert(header, value).is_some() {
                 return Err("conflicting_authentication_headers".into());
             }
         } else {
             headers.insert(header, HeaderValue::from_static("preview"));
         }
+    }
+    if !cookies.is_empty() {
+        if headers.contains_key("cookie") {
+            return Err("conflicting_authentication_headers".into());
+        }
+        // Cookie names are case-sensitive. Ordering by name also makes the
+        // wire value independent of security-scheme names and binding order.
+        let value = cookies
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let mut value =
+            HeaderValue::from_str(&value).map_err(|_| "authentication_cookie_value_invalid")?;
+        value.set_sensitive(true);
+        headers.insert(reqwest::header::COOKIE, value);
     }
     Ok(headers)
 }

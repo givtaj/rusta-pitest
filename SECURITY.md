@@ -29,6 +29,12 @@ request bodies, but URL paths remain visible. Review reports before sharing.
 Command-line arguments and terminal output can also expose values to your local
 environment. Direct benchmark commands have no custom-header or session-cookie
 bindings. OpenAPI suites support runtime bearer/header API-key authentication.
+The unreleased cookie-security extension also binds declared cookie values
+through environment-variable names. It constructs one validated `Cookie`
+header for each selected operation's chosen security alternative; no cookie jar,
+login, or renewal is provided. Preview never reads those values, and suite
+reports/diagnostics omit runtime authentication values and binding names.
+Review the frozen contract before binding credentials to its operations.
 
 The authored workload runner, introduced in alpha.4, binds complete header
 values, including cookies and CSRF headers, through environment-variable names.

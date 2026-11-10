@@ -32,10 +32,13 @@ def main():
     ).group(1)
     requests = []
     api_headers = []
+    suite_cookie_headers = []
     workload_headers = []
     workload_writes = []
     lock = threading.Lock()
     api_token = "rusta-smoke-auth-secret"
+    suite_cookies = {user: f"rusta-smoke-{user}-cookie%=+/" for user in ("alice", "bob")}
+    suite_proof = "rusta-smoke-cookie-proof%=+/"
     fixture_id = "rusta-smoke-fixture-secret"
     reserved_fixture_id = "rusta-smoke;reserved,secret"
     reserved_fixture_path = "/api/v1/widgets/rusta-smoke%3Breserved%2Csecret"
@@ -95,6 +98,15 @@ def main():
             status = 503 if self.path == "/failure" else 200
             if self.path == "/openapi.json":
                 payload = json.dumps(openapi_contract).encode()
+            elif self.path.startswith("/suite-cookie/"):
+                cookie_headers = self.headers.get_all("Cookie", [])
+                with lock:
+                    suite_cookie_headers.append((self.path, cookie_headers))
+                user = next((user for user, value in suite_cookies.items()
+                             if cookie_headers == [f"proof={suite_proof}; session={value}"]), None)
+                owner = self.path.rsplit("/", 1)[-1]
+                status = 401 if user is None else (200 if user == owner else 403)
+                payload = json.dumps({"owner": owner, "private": "rusta-cookie-response-secret"}).encode()
             elif self.path == workload_path:
                 cookie = self.headers.get("Cookie")
                 csrf = self.headers.get("X-CSRF-Token")
@@ -148,7 +160,11 @@ def main():
             def run(arguments, expected=0, stdin="", environment=None):
                 env = os.environ.copy()
                 if environment:
-                    env.update(environment)
+                    for name, value in environment.items():
+                        if value is None:
+                            env.pop(name, None)
+                        else:
+                            env[name] = value
                 result = subprocess.run(
                     [str(binary), *arguments], cwd=directory, input=stdin,
                     capture_output=True, text=True, timeout=15, env=env,
@@ -421,6 +437,82 @@ components:
             assert not any(method == "POST" and path.startswith("/api/")
                            for method, path, _ in requests)
 
+            # Generated suites bind individual cookie values, separately from
+            # authored workloads' complete header bindings below.
+            cookie_contract = {
+                "openapi": "3.1.0", "info": {"title": "Cookie smoke", "version": "1"},
+                "security": [{"session": [], "proof": []}],
+                "components": {"securitySchemes": {
+                    "session": {"type": "apiKey", "in": "cookie", "name": "session"},
+                    "proof": {"type": "apiKey", "in": "cookie", "name": "proof"},
+                }},
+                "paths": {f"/suite-cookie/{user}": {"get": {
+                    "operationId": f"cookie{user.title()}", "responses": {
+                        "200": {"description": "Owned resource", "content": {"application/json": {
+                            "schema": {"type": "object", "required": ["owner"],
+                                       "properties": {"owner": {"const": user}}},
+                        }}},
+                        "401": {"description": "Unknown or revoked session"},
+                        "403": {"description": "Another user's resource"},
+                    },
+                }} for user in suite_cookies},
+            }
+            (directory / "cookie-contract.json").write_text(json.dumps(cookie_contract))
+            run(["openapi", "generate", "cookie-contract.json", "--out", "cookie-suite.json"])
+            cookie_target = ["--base-url", origin,
+                             "--auth-env", "session=RUSTA_SMOKE_SUITE_COOKIE",
+                             "--auth-env", "proof=RUSTA_SMOKE_SUITE_PROOF"]
+            cookie_secrets = (*suite_cookies.values(), suite_proof,
+                              "rusta-cookie-response-secret", "rusta-cookie-revoked",
+                              "rusta-cookie-malformed; injected=value")
+
+            def cookie_report(name, operation, value, expected=0, execute=True):
+                cookie_env = {"RUSTA_SMOKE_SUITE_COOKIE": value,
+                              "RUSTA_SMOKE_SUITE_PROOF": suite_proof if execute else None}
+                result = run(["suite", "run", "cookie-suite.json", *cookie_target,
+                              "--operation", operation, *(["--execute"] if execute else []),
+                              "--output", f"{name}.json"], expected, environment=cookie_env)
+                document = json.loads((directory / f"{name}.json").read_text())
+                check_identity(document["runner"])
+                assert document["schema_version"] == 1 and document["kind"] == "suite"
+                assert document["executed"] is execute
+                evidence = result.stdout + result.stderr + json.dumps(document)
+                for secret in cookie_secrets:
+                    assert secret not in evidence, "cookie report disclosed runtime data"
+                    assert secret not in (directory / "cookie-suite.json").read_text()
+                for binding in ("RUSTA_SMOKE_SUITE_COOKIE", "RUSTA_SMOKE_SUITE_PROOF"):
+                    assert binding not in evidence, "cookie report disclosed a runtime binding"
+                return document
+
+            before = len(requests)
+            for index, value in enumerate((None, "rusta-cookie-malformed; injected=value")):
+                preview = cookie_report(f"cookie-preview-{index}", "cookieAlice", value, execute=False)
+                assert preview["ready"] is True and preview["passed"] is None
+            assert len(requests) == before, "cookie preview must not read secrets or send traffic"
+
+            for value in (None, "", "rusta-cookie-malformed; injected=value"):
+                rejected = run(["suite", "run", "cookie-suite.json", *cookie_target,
+                                "--operation", "cookieAlice", "--execute"], expected=1,
+                               environment={"RUSTA_SMOKE_SUITE_COOKIE": value,
+                                            "RUSTA_SMOKE_SUITE_PROOF": suite_proof})
+                for secret in cookie_secrets:
+                    assert secret not in rejected.stdout + rejected.stderr
+            assert len(requests) == before, "invalid cookie bindings must fail before traffic"
+
+            for user, value in suite_cookies.items():
+                success = cookie_report(f"cookie-{user}", f"cookie{user.title()}", value)
+                assert success["passed"] is True and success["counts"]["passed"] == 1
+                assert success["counts"]["selected"] == 1 and success["counts"]["skipped"] == 1
+                assert suite_cookie_headers[-1] == (f"/suite-cookie/{user}",
+                                                    [f"proof={suite_proof}; session={value}"])
+            for name, value, status in (("revoked", "rusta-cookie-revoked", 401),
+                                        ("wrong-user", suite_cookies["bob"], 403)):
+                denied = cookie_report(f"cookie-{name}", "cookieAlice", value, expected=1)
+                row = next(case for case in denied["cases"] if case["id"] == "cookieAlice")
+                assert denied["passed"] is False and denied["counts"]["failed"] == 1
+                assert row["status"] == status and row["checks"]["status"] == "failed"
+            assert len(requests) == before + 4
+
             # Exercise the separate workload CLI from the packaged executable.
             # One offered request per group/phase keeps counts exact without a timing
             # or service-capacity claim, while sharing the transport across actors.
@@ -637,7 +729,7 @@ components:
         server.shutdown()
         server.server_close()
         worker.join(timeout=2)
-    print(f"Release smoke passed: {version}; GET, POST, duration, statuses, timeout, JSON accounting, OpenAPI JSON/YAML/URL generation and byte limits, decoded alias budgets, expanded schema preflight, previews, authenticated GET/HEAD, reserved path data, partial-EOF cancellation, schema failure, workload actors/phases/denial/accounting, write opt-in/replay, thresholds/capture loss, redaction and output preservation")
+    print(f"Release smoke passed: {version}; GET, POST, duration, statuses, timeout, JSON accounting, OpenAPI JSON/YAML/URL generation and byte limits, decoded alias budgets, expanded schema preflight, previews, authenticated GET/HEAD, cookie bindings/isolation/denial, reserved path data, partial-EOF cancellation, schema failure, workload actors/phases/denial/accounting, write opt-in/replay, thresholds/capture loss, redaction and output preservation")
 
 
 if __name__ == "__main__":

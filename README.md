@@ -91,6 +91,13 @@ semantics remain visibly blocked. See [OpenAPI suites](docs/openapi-suites.md)
 for a [synthetic example](examples/widgets.openapi.yaml), execution, supported
 contracts, and coverage reports.
 
+**Unreleased:** development builds also bind declared cookie security schemes
+through `--auth-env session=TEST_SESSION_VALUE`. The environment variable holds
+only the cookie value; the contract supplies its name. Preview does not read
+credentials. See [private cookie bindings](docs/openapi-suites.md#private-cookie-bindings)
+for validation rules and the unchanged GET/HEAD scope. Published alpha.5 does
+not include this capability.
+
 ## Authored workloads
 
 Introduced in `v0.1.0-alpha.4`, `workload run` previews an authored plan without
