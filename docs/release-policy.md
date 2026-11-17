@@ -43,7 +43,7 @@ cookie construction, isolated synthetic users, failed positive assertions for
 documented 401/403 responses, traffic-free preview without resolving secrets,
 and preflight rejection of missing/malformed/conflicting bindings. Built and
 extracted binaries must pass the cookie-authentication release smoke. This
-unreleased capability retains suite/report version 1 and selected GET/HEAD scope.
+alpha.6 capability retains suite/report version 1 and selected GET/HEAD scope.
 
 From alpha.4 onward, built and extracted binaries must additionally pass authored
 workload preview without secrets/traffic, isolated actor headers, expected denial,
@@ -62,7 +62,7 @@ through the built and extracted release binaries. Malformed fields and query
 budgets must reject the plan before setup as well as measured traffic. Preview
 must remain nonexecuting, and plans omitting queries must keep their existing
 behavior. The complete synthetic query example must be packaged and previewable.
-This unreleased addition retains workload version 1 and report schema version 2.
+This alpha.6 addition retains workload version 1 and report schema version 2.
 
 From alpha.5 onward, built and extracted binaries must also reject decoded YAML
 alias expansion beyond the configured input budget and excessive schema reference
@@ -119,8 +119,9 @@ other external service.
   Windows are unverified. The macOS executable is unsigned and not notarized.
 - Direct benchmarks use HTTP/HTTPS over HTTP/1.1 with closed-loop concurrency
   and connection reuse. Custom headers and session cookies are not supported by
-  those commands. OpenAPI suites support documented scalar headers, bearer and
-  header API-key authentication, with explicitly selected GET/HEAD execution.
+  those commands. OpenAPI suites support documented scalar headers, bearer,
+  header API-key and cookie authentication, with explicitly selected GET/HEAD
+  execution.
   Neither mode enables proxies, automatic retries, redirects, warmup, or
   distributed load generation.
 - Authored workloads support static per-actor cookie/custom-header bindings,

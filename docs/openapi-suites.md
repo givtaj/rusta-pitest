@@ -4,8 +4,8 @@ Introduced in `v0.1.0-alpha.3`, this experimental feature generates reviewable
 contract suites and executes selected GET/HEAD cases. The existing SleepAPI
 profiles and benchmark report schema v1 remain supported.
 
-Cookie security bindings described below are **unreleased** and require a build
-containing that change; published alpha.5 supports bearer/header API keys only.
+Cookie security bindings described below require alpha.6 or later. Earlier
+releases support bearer/header API keys only.
 
 ## Generate and review
 

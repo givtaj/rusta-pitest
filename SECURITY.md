@@ -29,7 +29,7 @@ request bodies, but URL paths remain visible. Review reports before sharing.
 Command-line arguments and terminal output can also expose values to your local
 environment. Direct benchmark commands have no custom-header or session-cookie
 bindings. OpenAPI suites support runtime bearer/header API-key authentication.
-The unreleased cookie-security extension also binds declared cookie values
+From alpha.6, cookie security schemes also bind declared cookie values
 through environment-variable names. It constructs one validated `Cookie`
 header for each selected operation's chosen security alternative; no cookie jar,
 login, or renewal is provided. Preview never reads those values, and suite
@@ -47,8 +47,8 @@ These workload-report rules do not remove the direct-command argument/terminal
 exposure described above. Environment access and target-service behavior remain
 part of the caller's environment. See [workloads](docs/workloads.md).
 
-The unreleased structured-query field stores literal names and values in the
-workload plan; it does not resolve environment variables or response data.
+The structured-query field introduced in alpha.6 stores literal names and values
+in the workload plan; it does not resolve environment variables or response data.
 Treat plans containing private query data as private files and review them before
 sharing or committing. Query names and values are omitted from runner previews,
 reports, evidence, and diagnostics, but a target or intermediary may log the
