@@ -124,7 +124,7 @@ already percent-encoded path data where necessary; no response extraction or
 dynamic URL templating occurs.
 
 Optional request fields are `expect_status`, `response_schema`, `body_env`,
-`body_file`, `content_type`, `idempotency_key_env`, and `query` (unreleased).
+`body_file`, `content_type`, `idempotency_key_env`, and `query` (from alpha.6).
 Without `expect_status`,
 any 2xx status passes; set an exact `401` or `403` for a denial case. An optional
 inline `response_schema` checks JSON using the supported schema subset and local
@@ -152,8 +152,8 @@ a failed setup prevents measured requests from starting.
 
 ## Structured query parameters
 
-**Unreleased:** development builds support an optional ordered `query` array
-on each request. Published alpha.5 does not include it. Supply literal strings
+From alpha.6, each request supports an optional ordered `query` array.
+Earlier releases reject this field. Supply literal strings
 as separate name/value pairs:
 
 ```json
@@ -192,8 +192,7 @@ and diagnostics; external logging remains outside its control. Authored IDs
 remain visible, so do not encode private query data into IDs.
 
 To run the [complete synthetic query plan](../examples/workload-query.json),
-start the Python fixture from the first section, then use a build containing
-this feature:
+start the Python fixture from the first section, then use alpha.6 or later:
 
 ```sh
 cargo run --locked -- workload run examples/workload-query.json

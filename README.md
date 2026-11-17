@@ -7,19 +7,19 @@ neither service is required to use the runner.
 
 ## Install the alpha
 
-`v0.1.0-alpha.5` bounds decoded JSON/YAML input and expanded schema references
-for OpenAPI suites and authenticated, fixed-arrival workloads. CLI options and the
+`v0.1.0-alpha.6` adds private cookie authentication to generated OpenAPI suites
+and bounded, ordered query parameters to authored workloads. CLI options and the
 JSON report schema may change in later alpha versions. The supported binaries are
 Linux x86_64 (Ubuntu 24.04 or a compatible glibc environment) and macOS arm64.
 Other operating systems and architectures are not verified for this release.
 
 Download the archive for your platform and `SHA256SUMS` from the
-[GitHub release](https://github.com/givtaj/rusta-pitest/releases/tag/v0.1.0-alpha.5).
+[GitHub release](https://github.com/givtaj/rusta-pitest/releases/tag/v0.1.0-alpha.6).
 Verify the downloaded archive before extracting it:
 
 ```sh
 # macOS; on Linux, use sha256sum instead of shasum -a 256.
-shasum -a 256 rusta-pitest-v0.1.0-alpha.5-*.tar.gz
+shasum -a 256 rusta-pitest-v0.1.0-alpha.6-*.tar.gz
 ```
 
 Compare the complete digest and filename with the matching line in
@@ -33,7 +33,7 @@ toolchain:
 
 ```sh
 cargo install --locked --git https://github.com/givtaj/rusta-pitest.git \
-  --tag v0.1.0-alpha.5 rusta-pitest
+  --tag v0.1.0-alpha.6 rusta-pitest
 rusta-pitest --version
 ```
 
@@ -41,7 +41,7 @@ This alpha is distributed through GitHub; no crates.io publication is required.
 The repository development examples below use `cargo run --release -- ...`;
 after installation, use `rusta-pitest ...` with the same arguments.
 
-See the [release notes](docs/releases/v0.1.0-alpha.5.md),
+See the [release notes](docs/releases/v0.1.0-alpha.6.md),
 [release thresholds](docs/release-policy.md), and [changelog](CHANGELOG.md).
 The release thresholds govern release quality. Authored workloads additionally
 provide per-run latency and failure thresholds; direct benchmarks and generated
@@ -86,17 +86,17 @@ rusta-pitest suite run /tmp/api.suite.json
 
 Execution requires `--execute`, an explicit `--base-url`, and selected
 `--operation` IDs. The initial runner permits GET/HEAD only, with fixture IDs
-and bearer/header API-key credentials bound at runtime. Writes and unsupported
-semantics remain visibly blocked. See [OpenAPI suites](docs/openapi-suites.md)
+and bearer/header API-key or cookie credentials bound at runtime. Writes and
+unsupported semantics remain visibly blocked. See [OpenAPI suites](docs/openapi-suites.md)
 for a [synthetic example](examples/widgets.openapi.yaml), execution, supported
 contracts, and coverage reports.
 
-**Unreleased:** development builds also bind declared cookie security schemes
+From alpha.6, suites also bind declared cookie security schemes
 through `--auth-env session=TEST_SESSION_VALUE`. The environment variable holds
 only the cookie value; the contract supplies its name. Preview does not read
 credentials. See [private cookie bindings](docs/openapi-suites.md#private-cookie-bindings)
-for validation rules and the unchanged GET/HEAD scope. Published alpha.5 does
-not include this capability.
+for validation rules and the unchanged GET/HEAD scope. Earlier releases do not
+include this capability.
 
 ## Authored workloads
 
@@ -117,12 +117,12 @@ automatic authentication renewal. Execution requires `--execute`, an explicit
 See [workloads](docs/workloads.md) for a runnable localhost fixture, the complete
 plan, credential handling, sequence semantics, limits, and schema-v2 reports.
 
-**Unreleased:** authored requests can also supply ordered `query` name/value
+From alpha.6, authored requests can also supply ordered `query` name/value
 pairs, including repeated names, empty values, and Unicode. Values are literal
 plan data, with bounded percent encoding and no automatic pagination or
 environment interpolation. See [structured query parameters](docs/workloads.md#structured-query-parameters)
-and the [complete synthetic example](examples/workload-query.json). Published
-alpha.5 rejects this field.
+and the [complete synthetic example](examples/workload-query.json). Earlier
+releases reject this field.
 
 From alpha.4, OpenAPI commands also accept bounded larger inputs:
 `openapi generate --max-input-bytes` defaults to 1 MiB, its
@@ -267,8 +267,8 @@ cargo run --release -- post http://127.0.0.1:3000/echo \
 The echo URL is an example requiring a server that accepts POST; Python's simple
 HTTP server does not provide it. Direct benchmark commands do not support custom
 headers or session cookies. OpenAPI suites provide contract-defined scalar headers
-and bearer/header API-key authentication. POST behavior is verified by a local server in the integration
-tests. Omitting `--json` sends an empty POST;
+and bearer/header API-key or cookie authentication. POST behavior is verified by
+a local server in the integration tests. Omitting `--json` sends an empty POST;
 providing it validates the JSON before sending and sets
 `Content-Type: application/json`. Each repetition sends the same body again.
 

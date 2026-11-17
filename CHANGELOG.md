@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-alpha.6 — 2026-11-17
 
 - Add bounded, ordered literal query pairs to authored workloads, preserving
   repeated names and empty values with exact UTF-8 percent encoding.
@@ -13,6 +13,11 @@
   cookie bindings, and serialize combined cookies deterministically.
 - Cover isolated synthetic users, denied positive cases, preview without secret
   resolution, and credential redaction in regressions and release-binary smokes.
+- Update the locked `quinn-udp` dependency to 0.5.16, addressing
+  RUSTSEC-2026-0538 found by the fresh release audit.
+
+See [release notes](docs/releases/v0.1.0-alpha.6.md) for compatibility and
+the static authentication and query boundaries.
 
 ## 0.1.0-alpha.5 — 2026-10-29
 
