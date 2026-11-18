@@ -288,6 +288,8 @@ This permits a canary group to retain capacity while another group is busy.
 There is no waiting queue, catch-up burst, redirect, automatic retry, or
 environment proxy. An arrival older than `max_start_lag_ms`, or already
 superseded by its next scheduled arrival, becomes `unsent: scheduler_late`.
+The same reason applies if its phase ends before the first request starts,
+even when the configured start-lag allowance extends past that deadline.
 Capacity and actor conflicts become `unsent: capacity` or `actor_busy`. The
 schedule never slides to accommodate slow responses. A sequence child's
 scheduled timestamp is the original sequence offer, so its start lag and
@@ -337,8 +339,9 @@ unsent/cancelled attempts. `latency` is actual start to terminal outcome;
 `start_lag` is scheduled offer to actual start; `scheduled_to_terminal` includes
 both. Each reports samples, approximate HDR p50/p95/p99 milliseconds and the
 maximum observed duration; empty distributions contain null values. Rates use
-the planned arrival window for offered/started and elapsed time including drain
-for completed attempts. They are not all the same throughput denominator.
+the planned arrival window for offered/started. For completed attempts,
+`completed_per_sec` uses `elapsed_secs`, measured through the end of the drain.
+The timer stops before final accounting, threshold evaluation, and report generation.
 
 Threshold metrics are `p95_ms`, `max_ms`, `start_lag_p95_ms`,
 `scheduled_p95_ms`, `error_rate`, and `unsent_rate`. Each has a nonnegative
