@@ -1,12 +1,14 @@
 name: Release artifacts
 
 on:
+  pull_request:
+    paths: ['docs/releases/v*.md']
   push:
     tags: ['v*']
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing version tag to build (for example v0.1.0-alpha.6)
+        description: Existing version tag to build (for example v0.1.0-alpha.7)
         required: true
         type: string
 
@@ -30,37 +32,49 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUSTUP_TOOLCHAIN: stable
-      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
       RELEASE_TARGET: ${{ matrix.target }}
     steps:
       - name: Validate requested version tag
         id: tag
+        if: github.event_name != 'pull_request'
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         shell: bash
         run: |
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Check out exact tag
+      - name: Check out release revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/tags/${{ steps.tag.outputs.tag }}
+          ref: ${{ github.event.pull_request.head.sha || format('refs/tags/{0}', steps.tag.outputs.tag) }}
           persist-credentials: false
 
       - name: Install stable Rust components
         run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy --component rust-docs
 
-      - name: Verify tag, package version and native target
+      - name: Verify release revision, package version and native target
         shell: bash
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
         run: |
+          if [[ -n "$PR_HEAD_SHA" ]]; then
+            test "$(git rev-parse HEAD)" = "$PR_HEAD_SHA"
+          else
+            test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          fi
           python3 - <<'PY'
           import json, os, subprocess
           metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--locked', '--no-deps', '--format-version', '1'], text=True))
           version = metadata['packages'][0]['version']
-          assert os.environ['RELEASE_TAG'] == 'v' + version
+          if os.environ['RELEASE_TAG']:
+              assert os.environ['RELEASE_TAG'] == 'v' + version
           host = next(line.removeprefix('host: ') for line in subprocess.check_output(['rustc', '-vV'], text=True).splitlines() if line.startswith('host: '))
           assert host == os.environ['RELEASE_TARGET'], (host, os.environ['RELEASE_TARGET'])
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              print(f'RELEASE_VERSION={version}', file=env)
           PY
-          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
 
       - name: Check formatting, lints and tests
         run: |
@@ -74,7 +88,7 @@ jobs:
         run: |
           cargo build --locked --release
           python3 scripts/release-smoke.py target/release/rusta-pitest \
-            --expected-version "${RELEASE_TAG#v}" \
+            --expected-version "$RELEASE_VERSION" \
             --expected-revision "$(git rev-parse HEAD)" \
             --expected-target "$RELEASE_TARGET" --require-clean
 
@@ -92,11 +106,14 @@ jobs:
 
       - name: Package binary, license and provenance
         shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
         run: |
           python3 - <<'PY'
           import hashlib, json, os, shutil, subprocess, tarfile
           from pathlib import Path
-          name = f"rusta-pitest-{os.environ['RELEASE_TAG']}-{os.environ['RELEASE_TARGET']}"
+          version = os.environ['RELEASE_VERSION']
+          name = f"rusta-pitest-v{version}-{os.environ['RELEASE_TARGET']}"
           output = Path('target/release-assets')
           package = output / name
           package.mkdir(parents=True)
@@ -111,8 +128,8 @@ jobs:
               destination.parent.mkdir(parents=True, exist_ok=True)
               shutil.copy2(source, destination)
           provenance = {
-              'version': os.environ['RELEASE_TAG'].removeprefix('v'),
-              'tag': os.environ['RELEASE_TAG'],
+              'version': version,
+              'tag': os.environ['RELEASE_TAG'] or None,
               'git_revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
               'target': os.environ['RELEASE_TARGET'],
               'rustc': subprocess.check_output(['rustc', '--version'], text=True).strip(),
@@ -144,7 +161,7 @@ jobs:
               checksummed.add(filename)
               assert digest(unpacked / name / filename) == expected
           assert checksummed == {path.relative_to(unpacked / name).as_posix() for path in (unpacked / name).rglob('*') if path.is_file() and path != unpacked / name / 'SHA256SUMS'}
-          required_files = [f'docs/releases/{os.environ["RELEASE_TAG"]}.md']
+          required_files = [f'docs/releases/v{version}.md']
           has_workloads = Path('src/workload.rs').is_file()
           has_workload_queries = Path('examples/workload-query.json').is_file()
           if has_workloads:
@@ -168,9 +185,10 @@ jobs:
           PY
 
       - name: Upload verified release artifacts
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: rusta-pitest-${{ env.RELEASE_TAG }}-${{ matrix.target }}
+          name: rusta-pitest-${{ steps.tag.outputs.tag }}-${{ matrix.target }}
           path: |
             target/release-assets/*.tar.gz
             target/release-assets/*.sha256

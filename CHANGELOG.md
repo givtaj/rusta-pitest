@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.0-alpha.7 — 2026-11-18
+
+- Reject unknown `--fixture` names during OpenAPI suite preflight, before any
+  request can use a generated value in place of the intended fixture.
+- Check string response headers literally, including quotes and backslashes.
+- Save the full `--output` report and preserve the runner's exit status when a
+  reader such as `head` closes stdout early.
+- Stop the workload throughput timer when the drain finishes. Final accounting,
+  threshold evaluation, and report generation no longer reduce the reported
+  completion rate.
+- Recheck the phase deadline before starting a new arrival. Count expired
+  arrivals as unsent with reason `scheduler_late`.
+- Use the bundled `examples/widgets.openapi.yaml` in the README quickstart and
+  create a fresh output directory on each run.
+
+See the [alpha.7 release notes](docs/releases/v0.1.0-alpha.7.md) for examples
+and guidance on comparing results with earlier versions.
+
 ## 0.1.0-alpha.6 — 2026-11-17
 
 - Add bounded, ordered literal query pairs to authored workloads, preserving
