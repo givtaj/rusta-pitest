@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     error::Error,
+    io::{self, Write},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -303,62 +304,73 @@ impl Report {
             && self.stats.contract.failed == 0
     }
 
-    pub fn print(&self) {
+    pub fn print(&self, out: &mut impl Write) -> io::Result<()> {
         let stats = &self.stats;
         let samples = stats.latency_us.len();
         let responses = stats.succeeded + stats.unexpected_status;
         let seconds = self.elapsed.as_secs_f64();
 
         if let Some(duration) = self.duration {
-            println!("Mode: HTTP/1.1, duration, closed loop");
-            println!("Request window: {} s", duration.as_secs());
-            println!("In-flight requests finish under their per-request timeout.");
+            writeln!(out, "Mode: HTTP/1.1, duration, closed loop")?;
+            writeln!(out, "Request window: {} s", duration.as_secs())?;
+            writeln!(
+                out,
+                "In-flight requests finish under their per-request timeout."
+            )?;
         } else {
-            println!("Mode: HTTP/1.1, fixed request count, closed loop");
+            writeln!(out, "Mode: HTTP/1.1, fixed request count, closed loop")?;
         }
-        println!("Warmup: none (connection setup is included)");
-        println!("Concurrency: {}", self.concurrency);
-        println!("Requests: {samples}");
-        println!("Succeeded: {}", stats.succeeded);
-        println!("Unexpected status: {}", stats.unexpected_status);
-        println!("Timeouts: {}", stats.timeouts);
-        println!("Transport errors: {}", stats.transport_errors);
+        writeln!(out, "Warmup: none (connection setup is included)")?;
+        writeln!(out, "Concurrency: {}", self.concurrency)?;
+        writeln!(out, "Requests: {samples}")?;
+        writeln!(out, "Succeeded: {}", stats.succeeded)?;
+        writeln!(out, "Unexpected status: {}", stats.unexpected_status)?;
+        writeln!(out, "Timeouts: {}", stats.timeouts)?;
+        writeln!(out, "Transport errors: {}", stats.transport_errors)?;
         if self.contract_enabled {
-            stats.contract.print();
+            stats.contract.print(out)?;
         }
-        println!("Elapsed: {seconds:.3} s");
-        println!(
+        writeln!(out, "Elapsed: {seconds:.3} s")?;
+        writeln!(
+            out,
             "Throughput: {:.2} complete responses/s",
             responses as f64 / seconds
-        );
-        println!(
+        )?;
+        writeln!(
+            out,
             "Successful throughput: {:.2} responses/s",
             stats.succeeded as f64 / seconds
-        );
+        )?;
 
         let statuses = stats
             .statuses
             .iter()
             .map(|(status, count)| format!("{status}={count}"))
             .collect::<Vec<_>>();
-        println!(
+        writeln!(
+            out,
             "HTTP statuses (complete responses): {}",
             if statuses.is_empty() {
                 "none".into()
             } else {
                 statuses.join(", ")
             }
-        );
-        println!("Latency samples: {samples}");
-        println!("Latency: all attempts, through full body or failure");
-        println!(
+        )?;
+        writeln!(out, "Latency samples: {samples}")?;
+        writeln!(out, "Latency: all attempts, through full body or failure")?;
+        writeln!(
+            out,
             "  p50: {:.3} ms | p95: {:.3} ms | p99: {:.3} ms",
             stats.latency_us.value_at_quantile(0.50) as f64 / 1000.0,
             stats.latency_us.value_at_quantile(0.95) as f64 / 1000.0,
             stats.latency_us.value_at_quantile(0.99) as f64 / 1000.0,
-        );
+        )?;
         if samples < 100 {
-            println!("Note: fewer than 100 samples; tail percentiles are not stable.");
+            writeln!(
+                out,
+                "Note: fewer than 100 samples; tail percentiles are not stable."
+            )?;
         }
+        Ok(())
     }
 }

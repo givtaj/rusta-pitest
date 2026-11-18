@@ -106,6 +106,10 @@ hard link in the same directory; the destination filesystem must support hard
 links. A failure during final writing/publication exits `1` and leaves existing
 files intact; the terminal report remains available.
 
+When you use `--output`, piping stdout to `head` still saves the full report.
+The runner finishes the requested operations and returns their usual pass/fail
+status even if the pipe reader exits early.
+
 Cancelled wizard runs create no files. `--output` with `catalogue` or
 `profile --dry-run` is rejected with exit `2` because neither produces measured
 results. An interrupted direct/profile process does not publish a completed

@@ -453,6 +453,43 @@ fn preview_and_existing_report_refusal_send_no_operation_requests() {
 }
 
 #[test]
+#[cfg(unix)]
+fn suite_preview_saves_the_full_report_when_piped_to_head() {
+    let directory = TempDir::new();
+    let mut paths = json!({});
+    for id in 0..256 {
+        paths[format!("/item-{id:03}")] = json!({"get": {
+            "operationId": format!("item-{id:03}"),
+            "responses": {"204": {"description": "No content"}}
+        }});
+    }
+    let suite = directory.generate(&contract(paths));
+    let mut runner = Command::new(env!("CARGO_BIN_EXE_rusta-pitest"))
+        .current_dir(&directory.0)
+        .args(["suite", "run", &suite, "--output", "preview.json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let head = Command::new("head")
+        .args(["-n", "1"])
+        .stdin(runner.stdout.take().unwrap())
+        .output()
+        .unwrap();
+    assert_exit(&head, true);
+    assert_eq!(head.stdout, b"{\n");
+    assert_exit(&runner.wait_with_output().unwrap(), true);
+
+    let report = directory.read_json("preview.json");
+    assert_eq!(report["kind"], "suite");
+    assert_eq!(report["mode"], "preview");
+    assert_eq!(report["counts"]["selected"], 256);
+    let cases = report["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 256);
+    assert_eq!(cases.last().unwrap()["id"], "item-255");
+}
+
+#[test]
 fn authenticated_execution_preserves_base_prefix_escapes_fixture_and_redacts_reports() {
     let directory = TempDir::new();
     let suite = directory.generate(&widget_contract(true));
@@ -638,6 +675,75 @@ fn whole_selection_preflight_prevents_requests_when_a_fixture_or_auth_is_missing
         assert_exit(&run(&directory.0, &args), false);
         assert!(server.finish().is_empty());
     }
+}
+
+#[test]
+fn unknown_fixture_cannot_silently_leave_a_generated_query_value_in_place() {
+    let directory = TempDir::new();
+    let mut spec = health_contract();
+    spec["paths"]["/health"]["get"]["parameters"] = json!([{
+        "name":"q", "in":"query", "required":true, "schema":{"type":"string"}
+    }]);
+    let suite = directory.generate(&spec);
+    let server = Server::start(|_| Response::json(200, json!({"status":"ok"})));
+    let mut args = vec![
+        "suite",
+        "run",
+        &suite,
+        "--base-url",
+        &server.url,
+        "--operation",
+        "health",
+        "--fixture",
+        "health.query.q=blue",
+    ];
+    let preview = run(&directory.0, &args);
+    args.push("--execute");
+    let execution = run(&directory.0, &args);
+    assert!(server.finish().is_empty());
+    for output in [preview, execution] {
+        assert_exit(&output, false);
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("fixture"), "{error}");
+        assert!(!error.contains("blue"));
+    }
+}
+
+#[test]
+fn fixture_declared_by_an_unselected_case_is_accepted_after_slot_rename() {
+    let directory = TempDir::new();
+    let mut spec = widget_contract(false);
+    spec["paths"]["/health"] = health_contract()["paths"]["/health"].clone();
+    directory.generate(&spec);
+    let mut reviewed = directory.read_json("suite.json");
+    let widget = reviewed["cases"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|case| case["id"] == "getWidget")
+        .unwrap();
+    widget["parameters"][0]["fixture"] = json!("widget-id");
+    let suite = directory.write("reviewed.json", serde_json::to_vec(&reviewed).unwrap());
+    let server = Server::start(|_| Response::json(200, json!({"status":"ok"})));
+    let output = run(
+        &directory.0,
+        &[
+            "suite",
+            "run",
+            &suite,
+            "--base-url",
+            &server.url,
+            "--operation",
+            "health",
+            "--fixture",
+            "widget-id=w_001",
+            "--execute",
+        ],
+    );
+    assert_exit(&output, true);
+    let requests = server.finish();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/health");
 }
 
 #[test]
@@ -872,6 +978,56 @@ fn malformed_media_and_unsupported_response_headers_are_blocked_before_traffic()
         );
         assert_exit(&output, false);
         assert!(server.finish().is_empty());
+    }
+}
+
+#[test]
+fn response_headers_validate_string_literals_and_typed_scalars() {
+    let directory = TempDir::new();
+    let mut spec = health_contract();
+    spec["paths"]["/health"]["get"]["responses"]["200"] = json!({
+        "description": "OK",
+        "headers": {
+            "X-Mode": {"required": true, "schema": {"type": "string", "enum": ["staging", "\"qa\""]}},
+            "X-Limit": {"required": true, "schema": {"type": "integer", "const": 10}},
+            "X-Ready": {"required": true, "schema": {"type": "boolean", "const": true}}
+        }
+    });
+    let suite = directory.generate(&spec);
+    for (mode, passed) in [("staging", true), ("\"staging\"", false), ("\"qa\"", true)] {
+        let server = Server::start_socket(move |_, stream| {
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nX-Mode: {mode}\r\nX-Limit: 10\r\nX-Ready: true\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let output = run(
+            &directory.0,
+            &[
+                "suite",
+                "run",
+                &suite,
+                "--base-url",
+                &server.url,
+                "--operation",
+                "health",
+                "--execute",
+            ],
+        );
+        assert_exit(&output, passed);
+        assert_eq!(server.finish().len(), 1);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["passed"], passed);
+        let case = &report["cases"][0];
+        assert_eq!(
+            case["checks"]["headers"],
+            if passed { "passed" } else { "failed" }
+        );
+        if !passed {
+            assert_eq!(case["reasons"], json!(["response_header_mismatch"]));
+        }
     }
 }
 

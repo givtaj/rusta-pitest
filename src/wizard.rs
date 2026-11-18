@@ -23,51 +23,58 @@ impl From<io::Error> for PromptError {
     }
 }
 
-pub fn run() -> io::Result<Option<Request>> {
-    match configure() {
+pub fn run(out: &mut impl Write) -> io::Result<Option<Request>> {
+    match configure(out) {
         Ok(request) => Ok(Some(request)),
         Err(PromptError::Cancelled) => {
-            println!("Cancelled.");
+            writeln!(out, "Cancelled.")?;
             Ok(None)
         }
         Err(PromptError::Io(error)) => Err(error),
     }
 }
 
-fn configure() -> Result<Request, PromptError> {
-    println!("rusta-pitest");
-    println!("Press Enter to accept a default, or type q to quit at any prompt.\n");
-    println!("Choose a request:");
-    println!("  1) Roots greeting — GET /api/hello");
-    println!("  2) Roots database health — GET /api/health");
-    println!("  3) Custom GET");
-    println!("  4) Custom POST");
-    println!("  5) Roots catalogue");
-    println!("  6) SleepAPI benchmark profile — all four waiting endpoints");
-    let target = ask("Request", Some("1"), |input| match input {
+fn configure(out: &mut impl Write) -> Result<Request, PromptError> {
+    writeln!(out, "rusta-pitest")?;
+    writeln!(
+        out,
+        "Press Enter to accept a default, or type q to quit at any prompt.\n"
+    )?;
+    writeln!(out, "Choose a request:")?;
+    writeln!(out, "  1) Roots greeting — GET /api/hello")?;
+    writeln!(out, "  2) Roots database health — GET /api/health")?;
+    writeln!(out, "  3) Custom GET")?;
+    writeln!(out, "  4) Custom POST")?;
+    writeln!(out, "  5) Roots catalogue")?;
+    writeln!(
+        out,
+        "  6) SleepAPI benchmark profile — all four waiting endpoints"
+    )?;
+    let target = ask(out, "Request", Some("1"), |input| match input {
         "1" | "2" | "3" | "4" | "5" | "6" => Ok(input.to_owned()),
         _ => Err("Choose 1, 2, 3, 4, 5, or 6.".into()),
     })?;
 
     if target == "6" {
-        return configure_sleepapi();
+        return configure_sleepapi(out);
     }
 
     let preset = match target.as_str() {
         "1" => Some(ROOTS_TARGETS[0]),
         "2" => Some(ROOTS_TARGETS[1]),
         "5" => {
-            println!("\nRoots catalogue:");
+            writeln!(out, "\nRoots catalogue:")?;
             for (index, preset) in ROOTS_TARGETS.iter().enumerate() {
-                println!(
+                writeln!(
+                    out,
                     "  {}) {} — GET {} — expect {}",
                     index + 1,
                     preset.label,
                     preset.path,
                     preset.expected_status
-                );
+                )?;
             }
-            Some(ask("Target (number or ID)", Some("1"), |input| {
+            Some(ask(out, "Target (number or ID)", Some("1"), |input| {
                 input
                     .parse::<usize>()
                     .ok()
@@ -82,9 +89,14 @@ fn configure() -> Result<Request, PromptError> {
     let (method, url) = match target.as_str() {
         "1" | "2" | "5" => {
             let preset = preset.unwrap();
-            println!("\n{}", preset.description);
+            writeln!(out, "\n{}", preset.description)?;
             let base = if target == "5" {
-                ask("Roots API base URL", Some(ROOTS_BASE_URL), parse_base_url)?
+                ask(
+                    out,
+                    "Roots API base URL",
+                    Some(ROOTS_BASE_URL),
+                    parse_base_url,
+                )?
             } else {
                 parse_base_url(ROOTS_BASE_URL).unwrap()
             };
@@ -96,11 +108,12 @@ fn configure() -> Result<Request, PromptError> {
             } else {
                 Method::GET
             };
-            (method, ask("URL", None, parse_url)?)
+            (method, ask(out, "URL", None, parse_url)?)
         }
     };
     let json = if method == Method::POST {
         ask(
+            out,
             "JSON body (one line; Enter for an empty body)",
             Some(""),
             |input| {
@@ -115,11 +128,11 @@ fn configure() -> Result<Request, PromptError> {
         None
     };
 
-    println!("\nChoose a run:");
-    println!("  1) Send one request");
-    println!("  2) Benchmark");
-    println!("  3) Benchmark for a duration");
-    let run_type = ask("Run type", Some("1"), |input| match input {
+    writeln!(out, "\nChoose a run:")?;
+    writeln!(out, "  1) Send one request")?;
+    writeln!(out, "  2) Benchmark")?;
+    writeln!(out, "  3) Benchmark for a duration")?;
+    let run_type = ask(out, "Run type", Some("1"), |input| match input {
         "1" => Ok(1),
         "2" => Ok(2),
         "3" => Ok(3),
@@ -127,31 +140,35 @@ fn configure() -> Result<Request, PromptError> {
     })?;
     let (requests, duration_secs, concurrency) = match run_type {
         2 => {
-            let requests = ask("Total requests", Some("100"), |input| {
+            let requests = ask(out, "Total requests", Some("100"), |input| {
                 positive(input, u32::MAX)
             })?;
             let default_concurrency = requests.min(4).to_string();
-            let concurrency = ask("Concurrent requests", Some(&default_concurrency), |input| {
-                positive(input, u32::from(u16::MAX)).map(|value| value as u16)
-            })?;
+            let concurrency = ask(
+                out,
+                "Concurrent requests",
+                Some(&default_concurrency),
+                |input| positive(input, u32::from(u16::MAX)).map(|value| value as u16),
+            )?;
             (requests, None, concurrency)
         }
         3 => {
-            let duration_secs = ask("Duration (seconds)", Some("60"), |input| {
+            let duration_secs = ask(out, "Duration (seconds)", Some("60"), |input| {
                 positive(input, u32::MAX)
             })?;
-            let concurrency = ask("Concurrent requests", Some("4"), |input| {
+            let concurrency = ask(out, "Concurrent requests", Some("4"), |input| {
                 positive(input, u32::from(u16::MAX)).map(|value| value as u16)
             })?;
             (1, Some(duration_secs), concurrency)
         }
         _ => (1, None, 1),
     };
-    let timeout_ms = ask("Timeout per request (ms)", Some("5000"), |input| {
+    let timeout_ms = ask(out, "Timeout per request (ms)", Some("5000"), |input| {
         positive(input, u32::MAX)
     })?;
     let default_status = preset.map_or_else(|| "2xx".into(), |p| p.expected_status.to_string());
     let expect_status = ask(
+        out,
         "Expected status (2xx for any success)",
         Some(&default_status),
         |input| {
@@ -173,26 +190,31 @@ fn configure() -> Result<Request, PromptError> {
             expect_status,
         },
     };
-    println!("\nReady to run:");
-    println!("  {method} {}", options.url);
+    writeln!(out, "\nReady to run:")?;
+    writeln!(out, "  {method} {}", options.url)?;
     if let Some(duration_secs) = duration_secs {
-        println!("  Duration: {duration_secs} seconds");
-        println!("  Concurrency: {concurrency}");
+        writeln!(out, "  Duration: {duration_secs} seconds")?;
+        writeln!(out, "  Concurrency: {concurrency}")?;
     } else {
-        println!("  Requests: {requests}");
-        println!("  Concurrency: {}", u32::from(concurrency).min(requests));
+        writeln!(out, "  Requests: {requests}")?;
+        writeln!(
+            out,
+            "  Concurrency: {}",
+            u32::from(concurrency).min(requests)
+        )?;
     }
-    println!("  Timeout: {timeout_ms} ms");
-    println!(
+    writeln!(out, "  Timeout: {timeout_ms} ms")?;
+    writeln!(
+        out,
         "  Expected status: {}",
         expect_status.map_or_else(|| "2xx".into(), |status| status.to_string())
-    );
+    )?;
     if let Some(body) = &json {
-        println!("  JSON body: {body}");
+        writeln!(out, "  JSON body: {body}")?;
     } else if method == Method::POST {
-        println!("  Body: empty");
+        writeln!(out, "  Body: empty")?;
     }
-    let confirmed = ask("Run? (y/n)", Some("y"), |input| {
+    let confirmed = ask(out, "Run? (y/n)", Some("y"), |input| {
         if input.eq_ignore_ascii_case("y") || input.eq_ignore_ascii_case("yes") {
             Ok(true)
         } else if input.eq_ignore_ascii_case("n") || input.eq_ignore_ascii_case("no") {
@@ -205,25 +227,36 @@ fn configure() -> Result<Request, PromptError> {
         return Err(PromptError::Cancelled);
     }
 
-    println!("\nRunning…\n");
+    writeln!(out, "\nRunning…\n")?;
     Ok(Request::Http(method, options, json))
 }
 
-fn configure_sleepapi() -> Result<Request, PromptError> {
+fn configure_sleepapi(out: &mut impl Write) -> Result<Request, PromptError> {
     use crate::profile::{
         ProfileName, ProfileOptions, SLEEPAPI_BASE_URL, SLEEPAPI_ROUTES, Scenario,
         parse_response_status,
     };
     use clap::ValueEnum;
 
-    println!("\nSleepAPI: run the same workload against four endpoints in sequence.");
-    let base_url = ask("SleepAPI base URL", Some(SLEEPAPI_BASE_URL), parse_base_url)?;
-    println!("  baseline — configurable delay and response status (default: 400 ms, 200)");
+    writeln!(
+        out,
+        "\nSleepAPI: run the same workload against four endpoints in sequence."
+    )?;
+    let base_url = ask(
+        out,
+        "SleepAPI base URL",
+        Some(SLEEPAPI_BASE_URL),
+        parse_base_url,
+    )?;
+    writeln!(
+        out,
+        "  baseline — configurable delay and response status (default: 400 ms, 200)"
+    )?;
     for scenario in Scenario::value_variants() {
         let (delay, status) = scenario.defaults();
-        println!("  {} — {delay} ms, HTTP {status}", scenario.name());
+        writeln!(out, "  {} — {delay} ms, HTTP {status}", scenario.name())?;
     }
-    let scenario = ask("Scenario", Some("baseline"), |input| {
+    let scenario = ask(out, "Scenario", Some("baseline"), |input| {
         if input == "baseline" {
             Ok(None)
         } else {
@@ -232,6 +265,7 @@ fn configure_sleepapi() -> Result<Request, PromptError> {
     })?;
     let (default_delay, default_status) = scenario.map_or((400, 200), Scenario::defaults);
     let delay_ms = ask(
+        out,
         "Server delay (ms)",
         Some(&default_delay.to_string()),
         |input| {
@@ -244,6 +278,7 @@ fn configure_sleepapi() -> Result<Request, PromptError> {
     )?;
     let status_code = if scenario.is_none() {
         Some(ask(
+            out,
             "Server response status",
             Some("200"),
             parse_response_status,
@@ -253,11 +288,14 @@ fn configure_sleepapi() -> Result<Request, PromptError> {
     };
     let expected_default = status_code.unwrap_or(default_status);
 
-    println!("\nChoose a run (settings apply to each of the four endpoints):");
-    println!("  1) One request per endpoint");
-    println!("  2) Benchmark by request count");
-    println!("  3) Benchmark for a duration");
-    let run_type = ask("Run type", Some("2"), |input| match input {
+    writeln!(
+        out,
+        "\nChoose a run (settings apply to each of the four endpoints):"
+    )?;
+    writeln!(out, "  1) One request per endpoint")?;
+    writeln!(out, "  2) Benchmark by request count")?;
+    writeln!(out, "  3) Benchmark for a duration")?;
+    let run_type = ask(out, "Run type", Some("2"), |input| match input {
         "1" => Ok(1),
         "2" => Ok(2),
         "3" => Ok(3),
@@ -265,10 +303,11 @@ fn configure_sleepapi() -> Result<Request, PromptError> {
     })?;
     let (requests, duration_secs, concurrency) = match run_type {
         2 => {
-            let requests = ask("Requests per endpoint", Some("100"), |input| {
+            let requests = ask(out, "Requests per endpoint", Some("100"), |input| {
                 positive(input, u32::MAX)
             })?;
             let concurrency = ask(
+                out,
                 "Concurrent requests",
                 Some(&requests.min(4).to_string()),
                 |input| positive(input, u32::from(u16::MAX)).map(|value| value as u16),
@@ -276,10 +315,13 @@ fn configure_sleepapi() -> Result<Request, PromptError> {
             (requests, None, concurrency)
         }
         3 => {
-            let seconds = ask("Duration per endpoint (seconds)", Some("30"), |input| {
-                positive(input, u32::MAX)
-            })?;
-            let concurrency = ask("Concurrent requests", Some("4"), |input| {
+            let seconds = ask(
+                out,
+                "Duration per endpoint (seconds)",
+                Some("30"),
+                |input| positive(input, u32::MAX),
+            )?;
+            let concurrency = ask(out, "Concurrent requests", Some("4"), |input| {
                 positive(input, u32::from(u16::MAX)).map(|value| value as u16)
             })?;
             (1, Some(seconds), concurrency)
@@ -287,25 +329,28 @@ fn configure_sleepapi() -> Result<Request, PromptError> {
         _ => (1, None, 1),
     };
     if matches!(scenario, Some(Scenario::ClientTimeout)) {
-        println!(
+        writeln!(
+            out,
             "Choose a timeout shorter than {delay_ms} ms to cause client timeouts; they count as failures."
-        );
+        )?;
     }
-    let timeout_ms = ask("Timeout per request (ms)", Some("5000"), |input| {
+    let timeout_ms = ask(out, "Timeout per request (ms)", Some("5000"), |input| {
         positive(input, u32::MAX)
     })?;
     let expect_status = ask(
+        out,
         "Expected status",
         Some(&expected_default.to_string()),
         parse_status,
     )?;
 
-    println!("\nReady to run SleepAPI profile:");
+    writeln!(out, "\nReady to run SleepAPI profile:")?;
     for route in SLEEPAPI_ROUTES {
-        println!(
+        writeln!(
+            out,
             "  POST {}",
             base_url.join(route).expect("valid SleepAPI route")
-        );
+        )?;
     }
     let mut body = if let Some(scenario) = scenario {
         serde_json::json!({"scenario": scenario.name()})
@@ -313,27 +358,32 @@ fn configure_sleepapi() -> Result<Request, PromptError> {
         serde_json::json!({"status_code": status_code.unwrap()})
     };
     body["duration_ms"] = serde_json::json!(delay_ms);
-    println!("  JSON body: {body}");
+    writeln!(out, "  JSON body: {body}")?;
     if let Some(seconds) = duration_secs {
-        println!(
+        writeln!(
+            out,
             "  Duration: {seconds} seconds per endpoint (four sequential windows, plus in-flight completion)"
-        );
+        )?;
     } else {
-        println!(
+        writeln!(
+            out,
             "  Requests: {requests} per endpoint ({} total)",
             u64::from(requests) * 4
-        );
+        )?;
     }
     let effective_concurrency = if duration_secs.is_some() {
         u32::from(concurrency)
     } else {
         u32::from(concurrency).min(requests)
     };
-    println!("  Concurrency: {effective_concurrency}");
-    println!("  Timeout: {timeout_ms} ms");
-    println!("  Expected status: {expect_status}");
-    println!("  Status checks only; no automatic retries or error-body assertions.");
-    let confirmed = ask("Run? (y/n)", Some("y"), |input| {
+    writeln!(out, "  Concurrency: {effective_concurrency}")?;
+    writeln!(out, "  Timeout: {timeout_ms} ms")?;
+    writeln!(out, "  Expected status: {expect_status}")?;
+    writeln!(
+        out,
+        "  Status checks only; no automatic retries or error-body assertions."
+    )?;
+    let confirmed = ask(out, "Run? (y/n)", Some("y"), |input| {
         match input.to_ascii_lowercase().as_str() {
             "y" | "yes" => Ok(true),
             "n" | "no" => Ok(false),
@@ -368,19 +418,18 @@ fn positive(input: &str, max: u32) -> Result<u32, String> {
 }
 
 fn ask<T>(
+    out: &mut impl Write,
     label: &str,
     default: Option<&str>,
     parse: impl Fn(&str) -> Result<T, String>,
 ) -> Result<T, PromptError> {
     loop {
-        let mut output = io::stdout().lock();
-        write!(output, "{label}")?;
+        write!(out, "{label}")?;
         if let Some(default) = default.filter(|value| !value.is_empty()) {
-            write!(output, " [{default}]")?;
+            write!(out, " [{default}]")?;
         }
-        write!(output, ": ")?;
-        output.flush()?;
-        drop(output);
+        write!(out, ": ")?;
+        out.flush()?;
 
         let mut line = String::new();
         // EOF, including an incomplete final line, must cancel before defaults
@@ -400,7 +449,7 @@ fn ask<T>(
         };
         match parse(input) {
             Ok(value) => return Ok(value),
-            Err(message) => println!("  {message}"),
+            Err(message) => writeln!(out, "  {message}")?,
         }
     }
 }

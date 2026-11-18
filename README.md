@@ -76,20 +76,21 @@ the runner itself does not.
 
 ## OpenAPI contract suites
 
-Generate a reviewable suite from a raw OpenAPI 3.1 JSON/YAML URL or local path,
-then preview it without API traffic:
+From the repository root, generate a suite from the bundled
+[widgets example](examples/widgets.openapi.yaml) and preview its two operations
+without sending API requests.
 
 ```sh
-rusta-pitest openapi generate ./openapi.yaml --out /tmp/api.suite.json
-rusta-pitest suite run /tmp/api.suite.json
+suite_dir=$(mktemp -d)
+rusta-pitest openapi generate examples/widgets.openapi.yaml --out "$suite_dir/widgets.suite.json"
+rusta-pitest suite run "$suite_dir/widgets.suite.json"
 ```
 
 Execution requires `--execute`, an explicit `--base-url`, and selected
 `--operation` IDs. The initial runner permits GET/HEAD only, with fixture IDs
 and bearer/header API-key or cookie credentials bound at runtime. Writes and
 unsupported semantics remain visibly blocked. See [OpenAPI suites](docs/openapi-suites.md)
-for a [synthetic example](examples/widgets.openapi.yaml), execution, supported
-contracts, and coverage reports.
+for supported OpenAPI 3.1 inputs, execution, and coverage reports.
 
 From alpha.6, suites also bind declared cookie security schemes
 through `--auth-env session=TEST_SESSION_VALUE`. The environment variable holds

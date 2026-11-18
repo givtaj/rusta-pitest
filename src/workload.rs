@@ -278,6 +278,7 @@ struct Cursor {
     group: String,
     phase: String,
     phase_start_ns: u64,
+    phase_end_ns: u64,
     rate: u32,
     next: u64,
     total: u64,
@@ -299,6 +300,7 @@ struct Active {
     group: String,
     phase: String,
     scheduled: Instant,
+    phase_end: Instant,
     actual_started: Arc<Mutex<Option<Instant>>>,
     steps: Vec<Step>,
     step: usize,
@@ -306,11 +308,52 @@ struct Active {
     request_id: String,
 }
 
-struct Completion {
-    id: u64,
-    outcome: Outcome,
-    started: Instant,
-    finished: Instant,
+enum TaskResult {
+    Completed {
+        id: u64,
+        outcome: Outcome,
+        started: Instant,
+        finished: Instant,
+    },
+    PhaseExpired {
+        id: u64,
+    },
+}
+
+impl TaskResult {
+    fn record(
+        self,
+        active: &mut BTreeMap<u64, Active>,
+        recorder: &mut Recorder,
+        sequences: &mut Counts,
+    ) -> (Active, Option<Outcome>) {
+        match self {
+            Self::Completed {
+                id,
+                outcome,
+                started,
+                finished,
+            } => {
+                let request = active.remove(&id).expect("tracked request");
+                recorder.finish(&request, &outcome, started, finished);
+                (request, Some(outcome))
+            }
+            Self::PhaseExpired { id } => {
+                let request = active.remove(&id).expect("tracked request");
+                // Dispatch reserved a slot, but the executor was never called.
+                recorder
+                    .series(&request.steps[0].request, &request.group, &request.phase)
+                    .counts
+                    .started -= 1;
+                recorder.unsent(&request, 0, "scheduler_late");
+                if request.sequence.is_some() {
+                    sequences.started -= 1;
+                    sequences.unsent += 1;
+                }
+                (request, None)
+            }
+        }
+    }
 }
 
 struct Recorder {
@@ -751,19 +794,21 @@ fn cursors(plan: &Plan) -> Vec<Cursor> {
     let mut result = Vec::new();
     let mut phase_start_ns = 0;
     for phase in &plan.phases {
+        let phase_end_ns = phase_start_ns + phase.duration_ms * 1_000_000;
         for (group, rate) in &phase.rates {
             if *rate > 0 {
                 result.push(Cursor {
                     group: group.clone(),
                     phase: phase.name.clone(),
                     phase_start_ns,
+                    phase_end_ns,
                     rate: *rate,
                     next: 0,
                     total: offers(phase.duration_ms, *rate),
                 });
             }
         }
-        phase_start_ns += phase.duration_ms * 1_000_000;
+        phase_start_ns = phase_end_ns;
     }
     result
 }
@@ -807,6 +852,7 @@ fn arrival(plan: &Plan, cursor: &Cursor, origin: Instant) -> Active {
         group: cursor.group.clone(),
         phase: cursor.phase.clone(),
         scheduled: origin + Duration::from_nanos(cursor.offset_ns()),
+        phase_end: origin + Duration::from_nanos(cursor.phase_end_ns),
         actual_started: Arc::new(Mutex::new(None)),
         steps,
         step: 0,
@@ -824,7 +870,7 @@ fn execute_http(_group: String, client: Client, request: Arc<PreparedRequest>) -
 }
 
 async fn finish_drain(
-    tasks: &mut JoinSet<Completion>,
+    tasks: &mut JoinSet<TaskResult>,
     active: &mut BTreeMap<u64, Active>,
     recorder: &mut Recorder,
     sequence_counts: &mut Counts,
@@ -836,20 +882,15 @@ async fn finish_drain(
     let mut task_failed = false;
     while let Some(result) = tasks.join_next().await {
         match result {
-            Ok(completion) => {
-                let request = active.remove(&completion.id).expect("tracked request");
-                recorder.finish(
-                    &request,
-                    &completion.outcome,
-                    completion.started,
-                    completion.finished,
-                );
+            Ok(result) => {
+                let (request, outcome) = result.record(active, recorder, sequence_counts);
+                let Some(outcome) = outcome else { continue };
                 let remaining = request.step + 1 < request.steps.len();
                 if remaining {
                     recorder.unsent(
                         &request,
                         request.step + 1,
-                        if completion.outcome.passed {
+                        if outcome.passed {
                             "drain_timeout"
                         } else {
                             "dependency_failed"
@@ -857,7 +898,7 @@ async fn finish_drain(
                     );
                 }
                 if request.sequence.is_some() {
-                    if !completion.outcome.passed {
+                    if !outcome.passed {
                         sequence_counts.completed += 1;
                         sequence_counts.failed += 1;
                     } else if remaining {
@@ -897,7 +938,7 @@ fn spawn(
     prepared: &Prepared,
     client: &Client,
     recorder: &mut Recorder,
-    tasks: &mut JoinSet<Completion>,
+    tasks: &mut JoinSet<TaskResult>,
     executor: Executor,
 ) {
     recorder.start(active);
@@ -910,11 +951,15 @@ fn spawn(
         .clone();
     let client = client.clone();
     let group = active.group.clone();
+    let admission_deadline = (active.step == 0).then_some(active.phase_end);
     tasks.spawn(async move {
         let started = Instant::now();
+        if admission_deadline.is_some_and(|deadline| started >= deadline) {
+            return TaskResult::PhaseExpired { id };
+        }
         *actual_started.lock().expect("start timestamp lock") = Some(started);
         let outcome = executor(group, client, request).await;
-        Completion {
+        TaskResult::Completed {
             id,
             outcome,
             started,
@@ -1080,7 +1125,7 @@ async fn run_with_executor(options: Options, executor: Executor) -> Result<Value
     let mut active = BTreeMap::<u64, Active>::new();
     let mut group_active = BTreeMap::<String, usize>::new();
     let mut actor_active = BTreeSet::<String>::new();
-    let mut tasks = JoinSet::<Completion>::new();
+    let mut tasks = JoinSet::<TaskResult>::new();
     let mut next_task = 0u64;
     let mut capture_incomplete = interrupted;
     loop {
@@ -1116,57 +1161,80 @@ async fn run_with_executor(options: Options, executor: Executor) -> Result<Value
         tokio::select! {
             biased;
             completion=tasks.join_next(),if !tasks.is_empty()=>{
-                let completion=completion.expect("pending task").map_err(|_|"workload_task_failed")?;
-                let mut request=active.remove(&completion.id).expect("tracked request");
-                recorder.finish(&request,&completion.outcome,completion.started,completion.finished);
-                let next_step=request.step+1;
-                if next_step<request.steps.len()&&completion.outcome.passed&&!interrupted&&!setup_failed {
-                    request.step=next_step;
-                    next_task+=1;
-                    spawn(&mut request,next_task,&prepared,&client,&mut recorder,&mut tasks,executor);
-                    active.insert(next_task,request);
-                } else {
-                    if next_step<request.steps.len() {
-                        recorder.unsent(&request,next_step,if interrupted||setup_failed {"run_cancelled"}else{"dependency_failed"});
+                let result = completion.expect("pending task").map_err(|_| "workload_task_failed")?;
+                let (mut request, outcome) = result.record(&mut active, &mut recorder, &mut sequence_counts);
+                if let Some(outcome) = outcome {
+                    let next_step = request.step + 1;
+                    let remaining = next_step < request.steps.len();
+                    if remaining && outcome.passed && !interrupted && !setup_failed {
+                        request.step = next_step;
+                        next_task += 1;
+                        spawn(&mut request, next_task, &prepared, &client, &mut recorder, &mut tasks, executor);
+                        active.insert(next_task, request);
+                        continue;
+                    }
+                    if remaining {
+                        recorder.unsent(&request, next_step, if interrupted || setup_failed { "run_cancelled" } else { "dependency_failed" });
                     }
                     if request.sequence.is_some() {
-                        if (interrupted||setup_failed)&&next_step<request.steps.len() {sequence_counts.cancelled+=1;}
-                        else {sequence_counts.completed+=1;if completion.outcome.passed {sequence_counts.passed+=1;}else{sequence_counts.failed+=1;}}
+                        if (interrupted || setup_failed) && remaining {
+                            sequence_counts.cancelled += 1;
+                        } else {
+                            sequence_counts.completed += 1;
+                            if outcome.passed { sequence_counts.passed += 1; } else { sequence_counts.failed += 1; }
+                        }
                     }
-                    *group_active.get_mut(&request.group).expect("group reservation")-=1;
-                    actor_active.remove(&request.actor);
                 }
+                *group_active.get_mut(&request.group).expect("group reservation") -= 1;
+                actor_active.remove(&request.actor);
             },
             _=&mut signal,if !interrupted=>{
                 interrupted=true;capture_incomplete=true;stopping=true;
                 drain_end=Some(Instant::now()+Duration::from_millis(plan.drain_timeout_ms));
             },
-            _=tokio::time::sleep_until(wake)=>{
-                if stopping {continue;}
-                let Some((index,_))=next else {continue;};
-                let cursor=&mut cursors[index];
-                let mut request=arrival(&plan,cursor,origin);
-                let now=Instant::now();
-                let expired=now.saturating_duration_since(request.scheduled)>Duration::from_millis(plan.max_start_lag_ms)
-                    ||(cursor.next+1<cursor.total&&origin+Duration::from_nanos(cursor.next_offset_ns())<=now);
-                let reason=if expired {Some("scheduler_late")}
-                    else if group_active.get(&request.group).copied().unwrap_or(0)>=plan.groups[&request.group].max_in_flight {Some("capacity")}
-                    else if actor_active.contains(&request.actor) {Some("actor_busy")}else{None};
-                if let Some(reason)=reason {
-                    recorder.unsent(&request,0,reason);
-                    if request.sequence.is_some(){sequence_counts.unsent+=1;}
-                } else {
-                    if request.sequence.is_some(){sequence_counts.started+=1;}
-                    *group_active.entry(request.group.clone()).or_default()+=1;
-                    actor_active.insert(request.actor.clone());
-                    next_task+=1;
-                    spawn(&mut request,next_task,&prepared,&client,&mut recorder,&mut tasks,executor);
-                    active.insert(next_task,request);
+            // An offer that is already due needs no timer tick.
+            _ = async {
+                if wake > now {
+                    tokio::time::sleep_until(wake).await;
                 }
-                cursor.next+=1;
+            } => {
+                if stopping { continue; }
+                let Some((index, _)) = next else { continue };
+                let cursor = &mut cursors[index];
+                let mut request = arrival(&plan, cursor, origin);
+                let now = Instant::now();
+                let expired = now >= request.phase_end
+                    || now.saturating_duration_since(request.scheduled) > Duration::from_millis(plan.max_start_lag_ms)
+                    || (cursor.next + 1 < cursor.total && origin + Duration::from_nanos(cursor.next_offset_ns()) <= now);
+                let reason = if expired {
+                    Some("scheduler_late")
+                } else if group_active.get(&request.group).copied().unwrap_or(0) >= plan.groups[&request.group].max_in_flight {
+                    Some("capacity")
+                } else if actor_active.contains(&request.actor) {
+                    Some("actor_busy")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    recorder.unsent(&request, 0, reason);
+                    if request.sequence.is_some() { sequence_counts.unsent += 1; }
+                } else {
+                    if request.sequence.is_some() { sequence_counts.started += 1; }
+                    *group_active.entry(request.group.clone()).or_default() += 1;
+                    actor_active.insert(request.actor.clone());
+                    next_task += 1;
+                    spawn(&mut request, next_task, &prepared, &client, &mut recorder, &mut tasks, executor);
+                    active.insert(next_task, request);
+                }
+                cursor.next += 1;
             }
         }
     }
+    // The measured window includes the drain. Final accounting and report
+    // generation must not change elapsed time or completed throughput.
+    let elapsed = origin.elapsed().as_secs_f64();
+    #[cfg(test)]
+    tests::advance_reporting_clock().await;
     let remaining_reason = if setup_failed {
         "setup_failed"
     } else if interrupted {
@@ -1201,7 +1269,6 @@ async fn run_with_executor(options: Options, executor: Executor) -> Result<Value
         && failures_allowed
         && thresholds_passed;
     let series:Vec<_>=recorder.metrics.iter().map(|((request,group,phase),metrics)|json!({"request":request,"group":group,"phase":phase,"metrics":metrics.json()})).collect();
-    let elapsed = origin.elapsed().as_secs_f64();
     let arrival_window_secs = plan
         .phases
         .iter()
@@ -1528,16 +1595,33 @@ mod tests {
             use std::os::unix::fs::OpenOptionsExt;
             file.mode(0o600);
         }
-        // create_new refuses both existing files and symlinks atomically; never
-        // truncate an attacker-precreated path in a shared temporary directory.
+        // create_new refuses both existing files and symlinks atomically.
         let file = file.open(path)?;
         serde_json::to_writer(file, value).map_err(std::io::Error::other)
     }
 
     fn options(value: Value) -> Options {
         static NEXT: AtomicU64 = AtomicU64::new(0);
+        let target = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        let root = target.join("workload-unit-fixtures");
+        let mut directory = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        for parent in [&target, &root] {
+            directory.recursive(true).create(parent).unwrap();
+            let metadata = std::fs::symlink_metadata(parent).unwrap();
+            assert!(metadata.is_dir(), "fixture parent must be a real directory");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(metadata.permissions().mode() & 0o022, 0);
+            }
+        }
         for _ in 0..64 {
-            let path = std::env::temp_dir().join(format!(
+            let path = root.join(format!(
                 "rusta-workload-unit-{}-{}.json",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
@@ -1563,6 +1647,10 @@ mod tests {
     fn unit_plan_creation_preserves_preexisting_files_and_symlinks() {
         let options = options(minimal_value());
         let path = options.plan;
+        assert_eq!(
+            path.parent().unwrap(),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/workload-unit-fixtures")
+        );
         let original = std::fs::read(&path).unwrap();
         assert_eq!(
             write_new_plan(&path, &json!({"replacement":true}))
@@ -1821,6 +1909,54 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn timer_waking_at_phase_end_cannot_dispatch_its_last_offer() {
+        for with_next_phase in [false, true] {
+            let mut value = minimal_value();
+            value["phases"] = json!([
+                {"name":"idle","duration_ms":10,"rates":{}},
+                {"name":"expiring","duration_ms":10,"rates":{"load":1}}
+            ]);
+            if with_next_phase {
+                value["phases"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"name":"next","duration_ms":100,"rates":{"load":1}}));
+            }
+            value["max_start_lag_ms"] = json!(100);
+            let options = options(value);
+            let path = options.plan.clone();
+            // Register the 10 ms offer timer, then wake it exactly at 20 ms.
+            // There is no later offer in that phase, and its lag is allowed.
+            let (report, ()) = tokio::join!(
+                biased;
+                run_with_executor(options, fake_http),
+                tokio::time::advance(Duration::from_millis(20)),
+            );
+            let report = report.unwrap();
+            std::fs::remove_file(path).unwrap();
+
+            assert_eq!(
+                report["counts"]["offered"],
+                if with_next_phase { 2 } else { 1 }
+            );
+            assert_eq!(report["counts"]["started"], u64::from(with_next_phase));
+            assert_eq!(report["counts"]["completed"], u64::from(with_next_phase));
+            assert_eq!(report["counts"]["unsent"], 1);
+            let records = report["evidence"]["records"].as_array().unwrap();
+            let expired = &records[0];
+            assert_eq!(expired["phase"], "expiring");
+            assert_eq!(expired["scheduled_ms"], 10.0);
+            assert!(expired["started_ms"].is_null());
+            assert_eq!(expired["reason"], "scheduler_late");
+            if with_next_phase {
+                assert_eq!(records[1]["phase"], "next");
+                assert_eq!(records[1]["scheduled_ms"], 20.0);
+                assert_eq!(records[1]["outcome"], "passed");
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn expired_slots_are_unsent_without_a_catch_up_burst() {
         let options = options(minimal_value());
         let path = options.plan.clone();
@@ -1869,6 +2005,110 @@ mod tests {
         );
     }
 
+    tokio::task_local! {
+        static REPORTING_DELAY: Duration;
+    }
+
+    pub(super) async fn advance_reporting_clock() {
+        if let Ok(delay) = REPORTING_DELAY.try_with(|delay| *delay) {
+            tokio::time::advance(delay).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_rate_includes_drain_and_excludes_report_processing() {
+        let mut value = minimal_value();
+        value["groups"] = json!({"slow":{"actors":["a"],"max_in_flight":1,"requests":["read"]}});
+        value["phases"][0]["duration_ms"] = json!(100);
+        value["phases"][0]["rates"] = json!({"slow":1});
+        let options = options(value);
+        let path = options.plan.clone();
+
+        let before = Instant::now();
+        let reporting_delay = Duration::from_secs(5);
+        let report = REPORTING_DELAY
+            .scope(reporting_delay, run_with_executor(options, fake_http))
+            .await
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        // The one-second request finishes during drain, after the 100 ms phase.
+        let completed_at = report["evidence"]["records"][0]["completed_ms"]
+            .as_f64()
+            .unwrap();
+        assert!(completed_at >= 1000.0);
+        assert_eq!(report["counts"]["completed"], 1);
+        let measured = (before.elapsed() - reporting_delay).as_secs_f64();
+        assert_eq!(measured * 1000.0, completed_at);
+        assert_eq!(report["elapsed_secs"], measured);
+        assert_eq!(report["rates"]["completed_per_sec"], 1.0 / measured);
+        assert_eq!(report["rates"]["offered_per_sec"], 10.0);
+        assert_eq!(report["rates"]["started_per_sec"], 10.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_worker_poll_at_phase_end_leaves_the_sequence_unsent() {
+        let mut value = minimal_value();
+        value["groups"]["load"] = json!({"actors":["a"], "max_in_flight":1,
+            "sequence":[{"request":"read"},{"request":"read"}]});
+        value["phases"] = json!([{"name":"normal","duration_ms":10,"rates":{"load":1}}]);
+        let plan: Plan = serde_json::from_value(value.clone()).unwrap();
+        let options = options(value);
+        let prepared = prepare(&plan, &options).unwrap();
+        std::fs::remove_file(options.plan).unwrap();
+        let origin = Instant::now();
+        let cursors = cursors(&plan);
+        let mut recorder = Recorder {
+            origin,
+            metrics: BTreeMap::new(),
+            capture: Capture::new(&plan.evidence),
+            next_request: 0,
+        };
+        initialize_metrics(&plan, &cursors, &mut recorder);
+        let mut request = arrival(&plan, &cursors[0], origin);
+        let mut tasks = JoinSet::new();
+        spawn(
+            &mut request,
+            1,
+            &prepared,
+            &workload_http::client(100).unwrap(),
+            &mut recorder,
+            &mut tasks,
+            |_, _, _| panic!("expired arrival invoked the HTTP executor"),
+        );
+        // The current-thread runtime cannot poll the spawned task until we yield.
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let result = tasks.join_next().await.unwrap().unwrap();
+        let mut active = BTreeMap::from([(1, request)]);
+        let mut sequences = Counts {
+            offered: 1,
+            started: 1,
+            ..Counts::default()
+        };
+        let (request, outcome) = result.record(&mut active, &mut recorder, &mut sequences);
+        assert!(request.actual_started.lock().unwrap().is_none());
+        assert!(outcome.is_none() && active.is_empty());
+        assert_eq!(
+            (sequences.offered, sequences.started, sequences.unsent),
+            (1, 0, 1)
+        );
+        let metrics = &recorder.metrics[&("read".into(), "load".into(), "normal".into())];
+        assert_eq!(
+            (
+                metrics.counts.offered,
+                metrics.counts.started,
+                metrics.counts.unsent
+            ),
+            (2, 0, 2)
+        );
+        assert!(metrics.latency.is_empty());
+        assert_eq!(recorder.capture.records.len(), 2);
+        for record in &recorder.capture.records {
+            assert_eq!(record["reason"], "scheduler_late");
+            assert!(record["started_ms"].is_null());
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn drain_preserves_success_that_completed_before_it_was_collected() {
         let plan = plan();
@@ -1887,7 +2127,7 @@ mod tests {
         let mut active = BTreeMap::from([(1, request)]);
         let mut tasks = JoinSet::new();
         let handle = tasks.spawn(async move {
-            Completion {
+            TaskResult::Completed {
                 id: 1,
                 outcome: Outcome {
                     passed: true,
@@ -1949,7 +2189,7 @@ mod tests {
         }
         let mut tasks = JoinSet::new();
         let handle = tasks.spawn(async move {
-            Completion {
+            TaskResult::Completed {
                 id: 1,
                 outcome: Outcome {
                     passed: false,
@@ -2021,7 +2261,7 @@ mod tests {
         let mut active = BTreeMap::from([(1, request)]);
         let mut tasks = JoinSet::new();
         let handle = tasks.spawn(async move {
-            Completion {
+            TaskResult::Completed {
                 id: 1,
                 outcome: Outcome {
                     passed: true,

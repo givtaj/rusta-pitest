@@ -14,7 +14,11 @@ mod wizard;
 mod workload;
 mod workload_http;
 
-use std::{path::Path, process::ExitCode};
+use std::{
+    io::{self, Write},
+    path::Path,
+    process::ExitCode,
+};
 
 use clap::{CommandFactory, Parser, error::ErrorKind};
 use reqwest::Method;
@@ -24,6 +28,18 @@ use cli::{Cli, Command};
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    let mut terminal = output::Terminal::new(cli.output.is_some());
+    let result = run(cli, &mut terminal).await;
+    match result.and_then(|code| terminal.finish().map(|()| code)) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("Cannot write stdout: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(cli: Cli, out: &mut impl Write) -> io::Result<ExitCode> {
     if cli.output.is_some()
         && (matches!(&cli.command, Some(Command::Catalogue))
             || matches!(&cli.command, Some(Command::Openapi { .. }))
@@ -47,23 +63,23 @@ async fn main() -> ExitCode {
                     max_suite_bytes,
                 },
         }) => {
-            return generate_suite(&source, &out, max_input_bytes, max_suite_bytes).await;
+            return Ok(generate_suite(&source, &out, max_input_bytes, max_suite_bytes).await);
         }
         Some(Command::Suite {
             command: cli::SuiteCommand::Run(options),
         }) => {
-            return run_suite(options, destination).await;
+            return run_suite(options, destination, out).await;
         }
         Some(Command::Workload {
             command: cli::WorkloadCommand::Run(options),
         }) => {
-            return run_workload(options, destination).await;
+            return run_workload(options, destination, out).await;
         }
         Some(Command::Catalogue) => {
             catalogue::print();
-            return ExitCode::SUCCESS;
+            return Ok(ExitCode::SUCCESS);
         }
-        Some(Command::Profile(options)) => return run_profile(options, destination).await,
+        Some(Command::Profile(options)) => return Ok(run_profile(options, destination, out).await),
         Some(Command::Target {
             target,
             base_url,
@@ -71,34 +87,34 @@ async fn main() -> ExitCode {
         }) => {
             let expected_status = *run.expect_status.get_or_insert(target.expected_status);
             let url = target.url(&base_url);
-            println!("Target: {} — {}", target.id, target.label);
-            println!("{}", target.description);
-            println!("GET {url}");
-            println!("Expected status: {expected_status}\n");
+            writeln!(out, "Target: {} — {}", target.id, target.label)?;
+            writeln!(out, "{}", target.description)?;
+            writeln!(out, "GET {url}")?;
+            writeln!(out, "Expected status: {expected_status}\n")?;
             (Method::GET, cli::Options { url, run }, None)
         }
         Some(Command::Get(options)) => (Method::GET, options, None),
         Some(Command::Post { options, json }) => (Method::POST, options, json),
-        Some(Command::Wizard) | None => match wizard::run() {
+        Some(Command::Wizard) | None => match wizard::run(out) {
             Ok(Some(wizard::Request::Http(method, options, json))) => (method, options, json),
             Ok(Some(wizard::Request::Profile(options))) => {
-                return run_profile(options, destination).await;
+                return Ok(run_profile(options, destination, out).await);
             }
-            Ok(None) => return ExitCode::SUCCESS,
+            Ok(None) => return Ok(ExitCode::SUCCESS),
             Err(error) => {
                 eprintln!("Wizard error: {error}");
-                return ExitCode::FAILURE;
+                return Ok(ExitCode::FAILURE);
             }
         },
     };
 
     let file = match prepare_report(destination) {
         Ok(file) => file,
-        Err(code) => return code,
+        Err(code) => return Ok(code),
     };
     let report = match bench::run(method, options, json).await {
         Ok(report) => {
-            report.print();
+            report.print(out)?;
             Some(report)
         }
         Err(error) => {
@@ -106,7 +122,7 @@ async fn main() -> ExitCode {
             None
         }
     };
-    finish(
+    Ok(finish(
         output::Document {
             kind: "request",
             profile: None,
@@ -116,7 +132,7 @@ async fn main() -> ExitCode {
             }],
         },
         file,
-    )
+    ))
 }
 
 async fn generate_suite(
@@ -173,10 +189,14 @@ async fn generate_suite(
     }
 }
 
-async fn run_suite(options: cli::SuiteOptions, destination: Option<&Path>) -> ExitCode {
+async fn run_suite(
+    options: cli::SuiteOptions,
+    destination: Option<&Path>,
+    out: &mut impl Write,
+) -> io::Result<ExitCode> {
     let file = match prepare_report(destination) {
         Ok(file) => file,
-        Err(code) => return code,
+        Err(code) => return Ok(code),
     };
     let result = suite_run::run(suite_run::RunOptions {
         suite: options.suite,
@@ -192,27 +212,10 @@ async fn run_suite(options: cli::SuiteOptions, destination: Option<&Path>) -> Ex
     })
     .await;
     match result {
-        Ok(report) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&report).expect("report is JSON")
-            );
-            let passed = report["passed"].as_bool().unwrap_or(!options.execute);
-            if let Some(file) = file
-                && file.finish_value(&report).is_err()
-            {
-                eprintln!("Cannot publish suite report");
-                return ExitCode::FAILURE;
-            }
-            if passed {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
+        Ok(report) => finish_json_report(&report, file, out, options.execute),
         Err(error) => {
             eprintln!("Suite preflight failed: {error}");
-            ExitCode::FAILURE
+            Ok(ExitCode::FAILURE)
         }
     }
 }
@@ -227,10 +230,14 @@ fn prepare_report(destination: Option<&Path>) -> Result<Option<output::ReportFil
         })
 }
 
-async fn run_workload(options: cli::WorkloadOptions, destination: Option<&Path>) -> ExitCode {
+async fn run_workload(
+    options: cli::WorkloadOptions,
+    destination: Option<&Path>,
+    out: &mut impl Write,
+) -> io::Result<ExitCode> {
     let file = match prepare_report(destination) {
         Ok(file) => file,
-        Err(code) => return code,
+        Err(code) => return Ok(code),
     };
     match workload::run(workload::Options {
         plan: options.plan,
@@ -241,29 +248,39 @@ async fn run_workload(options: cli::WorkloadOptions, destination: Option<&Path>)
     })
     .await
     {
-        Ok(report) => {
-            let passed = report["passed"].as_bool().unwrap_or(!options.execute);
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&report).expect("workload report is JSON")
-            );
-            if let Some(file) = file
-                && file.finish_value(&report).is_err()
-            {
-                eprintln!("Cannot publish workload report");
-                return ExitCode::FAILURE;
-            }
-            if passed {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
+        Ok(report) => finish_json_report(&report, file, out, options.execute),
         Err(error) => {
             eprintln!("Workload preflight failed: {error}");
-            ExitCode::FAILURE
+            Ok(ExitCode::FAILURE)
         }
     }
+}
+
+fn finish_json_report(
+    report: &serde_json::Value,
+    file: Option<output::ReportFile>,
+    out: &mut impl Write,
+    execute: bool,
+) -> io::Result<ExitCode> {
+    let published = file.map(|file| file.finish_value(report)).transpose();
+    // Keep the terminal copy available even when publishing the file fails.
+    writeln!(
+        out,
+        "{}",
+        serde_json::to_string_pretty(report).expect("report is JSON")
+    )?;
+    if let Err(error) = published {
+        eprintln!(
+            "Cannot publish {} report: {error}",
+            report["kind"].as_str().expect("report kind")
+        );
+        return Ok(ExitCode::FAILURE);
+    }
+    Ok(if report["passed"].as_bool().unwrap_or(!execute) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 fn finish(document: output::Document, file: Option<output::ReportFile>) -> ExitCode {
@@ -280,12 +297,16 @@ fn finish(document: output::Document, file: Option<output::ReportFile>) -> ExitC
     }
 }
 
-async fn run_profile(options: profile::ProfileOptions, destination: Option<&Path>) -> ExitCode {
+async fn run_profile(
+    options: profile::ProfileOptions,
+    destination: Option<&Path>,
+    out: &mut impl Write,
+) -> ExitCode {
     let file = match prepare_report(destination) {
         Ok(file) => file,
         Err(code) => return code,
     };
-    match profile::run(options).await {
+    match profile::run(options, out).await {
         Ok(Some(document)) => finish(document, file),
         Ok(None) => ExitCode::SUCCESS,
         Err(error) => {
