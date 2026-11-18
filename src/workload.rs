@@ -1595,16 +1595,33 @@ mod tests {
             use std::os::unix::fs::OpenOptionsExt;
             file.mode(0o600);
         }
-        // create_new refuses both existing files and symlinks atomically; never
-        // truncate an attacker-precreated path in a shared temporary directory.
+        // create_new refuses both existing files and symlinks atomically.
         let file = file.open(path)?;
         serde_json::to_writer(file, value).map_err(std::io::Error::other)
     }
 
     fn options(value: Value) -> Options {
         static NEXT: AtomicU64 = AtomicU64::new(0);
+        let target = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        let root = target.join("workload-unit-fixtures");
+        let mut directory = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        for parent in [&target, &root] {
+            directory.recursive(true).create(parent).unwrap();
+            let metadata = std::fs::symlink_metadata(parent).unwrap();
+            assert!(metadata.is_dir(), "fixture parent must be a real directory");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(metadata.permissions().mode() & 0o022, 0);
+            }
+        }
         for _ in 0..64 {
-            let path = std::env::temp_dir().join(format!(
+            let path = root.join(format!(
                 "rusta-workload-unit-{}-{}.json",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
@@ -1630,6 +1647,10 @@ mod tests {
     fn unit_plan_creation_preserves_preexisting_files_and_symlinks() {
         let options = options(minimal_value());
         let path = options.plan;
+        assert_eq!(
+            path.parent().unwrap(),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/workload-unit-fixtures")
+        );
         let original = std::fs::read(&path).unwrap();
         assert_eq!(
             write_new_plan(&path, &json!({"replacement":true}))
