@@ -9,6 +9,59 @@ use serde_json::{Value, json};
 
 use crate::bench::Report;
 
+/// With a requested report, a closed terminal must not interrupt measurement
+/// or publication. Surface other stdout errors after the report is saved.
+pub struct Terminal {
+    stdout: io::Stdout,
+    report_requested: bool,
+    error: Option<io::Error>,
+}
+
+impl Terminal {
+    pub fn new(report_requested: bool) -> Self {
+        Self {
+            stdout: io::stdout(),
+            report_requested,
+            error: None,
+        }
+    }
+
+    fn write_or_defer<T>(
+        &mut self,
+        discarded: T,
+        write: impl FnOnce(&mut io::Stdout) -> io::Result<T>,
+    ) -> io::Result<T> {
+        if self.error.is_some() {
+            return Ok(discarded);
+        }
+        match write(&mut self.stdout) {
+            Err(error) if self.report_requested && error.kind() != io::ErrorKind::Interrupted => {
+                self.error = Some(error);
+                Ok(discarded)
+            }
+            result => result,
+        }
+    }
+
+    pub fn finish(mut self) -> io::Result<()> {
+        self.flush()?;
+        match self.error {
+            Some(error) if error.kind() != io::ErrorKind::BrokenPipe => Err(error),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl Write for Terminal {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.write_or_defer(bytes.len(), |stdout| stdout.write(bytes))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.write_or_defer((), Write::flush)
+    }
+}
+
 pub struct RunRecord {
     pub route: Option<&'static str>,
     pub report: Option<Report>,

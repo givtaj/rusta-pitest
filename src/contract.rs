@@ -1,6 +1,9 @@
 use reqwest::{StatusCode, header::HeaderMap};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    io::{self, Write},
+};
 pub const BODY_LIMIT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy)]
@@ -173,18 +176,20 @@ impl ContractStats {
             "checked": self.checked, "passed": self.checked - self.failed,
             "failed": self.failed, "failures": self.failures })
     }
-    pub fn print(&self) {
-        println!("Contract checks: {}", self.checked);
-        println!("Contract failures: {}", self.failed);
+    pub fn print(&self, out: &mut impl Write) -> io::Result<()> {
+        writeln!(out, "Contract checks: {}", self.checked)?;
+        writeln!(out, "Contract failures: {}", self.failed)?;
         if !self.failures.is_empty() {
-            println!(
+            writeln!(
+                out,
                 "Contract failure reasons: {}",
                 self.failures
                     .iter()
                     .map(|(reason, count)| format!("{reason}={count}"))
                     .collect::<Vec<_>>()
                     .join(", ")
-            );
+            )?;
         }
+        Ok(())
     }
 }

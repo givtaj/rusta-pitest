@@ -131,11 +131,15 @@ fn respond(stream: &mut TcpStream, status: u16) {
 }
 
 fn run(directory: &Path, args: &[&str], input: &str) -> Output {
+    run_with_stdout(directory, args, input, Stdio::piped())
+}
+
+fn run_with_stdout(directory: &Path, args: &[&str], input: &str, stdout: Stdio) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rusta-pitest"))
         .current_dir(directory)
         .args(args)
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdout(stdout)
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
@@ -394,6 +398,57 @@ fn profile_reports_preserve_all_routes_and_respect_expected_failure_statuses() {
             assert_arithmetic(report);
         }
         assert_eq!(directory.files(), ["result.json"]);
+    }
+}
+
+#[test]
+fn profile_saves_every_route_and_returns_failure_when_stdout_is_closed() {
+    let directory = TempDir::new();
+    let server = Server::start(|request, stream| {
+        respond(
+            stream,
+            if request.path == "/sleep/tokio" {
+                500
+            } else {
+                200
+            },
+        );
+    });
+    // A reader that has already exited guarantees a broken pipe on the first print.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let output = run_with_stdout(
+        &directory.0,
+        &[
+            "profile",
+            "sleepapi",
+            "--base-url",
+            &server.url,
+            "--requests",
+            "1",
+            "--output",
+            "result.json",
+        ],
+        "",
+        writer.into(),
+    );
+    assert_exit(&output, 1);
+    let requests = server.finish();
+    let document = directory.report();
+    assert_eq!(document["passed"], false);
+    let runs = document["runs"].as_array().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(runs.len(), 4);
+    for ((request, run), route) in requests.iter().zip(runs).zip([
+        "/sleep/tokio",
+        "/sleep/tokio-spawn",
+        "/sleep/thread",
+        "/sleep/park",
+    ]) {
+        assert_eq!(request.path, route);
+        assert_eq!(run["route"], route);
+        assert_eq!(run["passed"], route != "/sleep/tokio");
+        assert_eq!(run["report"]["metrics"]["attempted"], 1);
     }
 }
 

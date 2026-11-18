@@ -1,4 +1,4 @@
-use std::error::Error;
+use std::{error::Error, io::Write};
 
 use clap::{Args, ValueEnum};
 use reqwest::{Method, Url};
@@ -127,7 +127,10 @@ pub fn parse_response_status(input: &str) -> Result<u16, String> {
         })
 }
 
-pub async fn run(options: ProfileOptions) -> Result<Option<Document>, Box<dyn Error>> {
+pub async fn run(
+    options: ProfileOptions,
+    out: &mut impl Write,
+) -> Result<Option<Document>, Box<dyn Error>> {
     // The wizard constructs these options directly, so keep the network entry
     // point safe even when clap did not perform validation.
     parse_base_url(options.base_url.as_str())?;
@@ -166,50 +169,81 @@ pub async fn run(options: ProfileOptions) -> Result<Option<Document>, Box<dyn Er
     };
 
     match options.profile {
-        ProfileName::Sleepapi => println!("SleepAPI benchmark profile"),
+        ProfileName::Sleepapi => writeln!(out, "SleepAPI benchmark profile")?,
     }
-    println!("Base URL: {}", options.base_url);
-    println!("Four endpoints run sequentially with the same workload.");
+    writeln!(out, "Base URL: {}", options.base_url)?;
+    writeln!(
+        out,
+        "Four endpoints run sequentially with the same workload."
+    )?;
     if let Some(scenario) = options.scenario {
-        println!("Scenario: {} — {}", scenario.name(), scenario.description());
+        writeln!(
+            out,
+            "Scenario: {} — {}",
+            scenario.name(),
+            scenario.description()
+        )?;
     }
-    println!("Server delay: {delay_ms} ms; configured response status: {status_code}");
-    println!("JSON: {payload}");
+    writeln!(
+        out,
+        "Server delay: {delay_ms} ms; configured response status: {status_code}"
+    )?;
+    writeln!(out, "JSON: {payload}")?;
     if let Some(seconds) = options.duration_secs {
-        println!("Request window per endpoint: {seconds} s (plus in-flight completion)");
+        writeln!(
+            out,
+            "Request window per endpoint: {seconds} s (plus in-flight completion)"
+        )?;
     } else {
-        println!("Requests per endpoint: {}", options.requests);
-        println!(
+        writeln!(out, "Requests per endpoint: {}", options.requests)?;
+        writeln!(
+            out,
             "Total planned requests: {}",
             u64::from(options.requests) * 4
-        );
+        )?;
     }
-    println!("Concurrency per endpoint: {}", options.concurrency);
-    println!("Timeout per request: {} ms", options.timeout_ms);
-    println!("Expected status: {expected_status}");
-    println!("Timeouts count as failures; use --timeout-ms below the server delay to test them.");
+    writeln!(out, "Concurrency per endpoint: {}", options.concurrency)?;
+    writeln!(out, "Timeout per request: {} ms", options.timeout_ms)?;
+    writeln!(out, "Expected status: {expected_status}")?;
+    writeln!(
+        out,
+        "Timeouts count as failures; use --timeout-ms below the server delay to test them."
+    )?;
     if options.validate_contract {
-        println!("Contract validation: every completed response; body limit 65536 bytes.");
-        println!("JSON fields and Retry-After asserted against the requested simulation.");
-        println!("Status matches are counted separately; any contract failure fails the profile.");
-        println!(
+        writeln!(
+            out,
+            "Contract validation: every completed response; body limit 65536 bytes."
+        )?;
+        writeln!(
+            out,
+            "JSON fields and Retry-After asserted against the requested simulation."
+        )?;
+        writeln!(
+            out,
+            "Status matches are counted separately; any contract failure fails the profile."
+        )?;
+        writeln!(
+            out,
             "Latency sampled before JSON validation; throughput includes validation overhead."
-        );
+        )?;
     } else {
-        println!("No retries; response bodies and Retry-After headers are not asserted.");
+        writeln!(
+            out,
+            "No retries; response bodies and Retry-After headers are not asserted."
+        )?;
     }
     if options.dry_run {
         for route in SLEEPAPI_ROUTES {
-            println!("POST {}", options.base_url.join(route)?);
+            writeln!(out, "POST {}", options.base_url.join(route)?)?;
         }
-        println!("Dry run: no requests sent.");
+        writeln!(out, "Dry run: no requests sent.")?;
         return Ok(None);
     }
 
     let mut results = Vec::with_capacity(SLEEPAPI_ROUTES.len());
     for route in SLEEPAPI_ROUTES {
         let url = options.base_url.join(route)?;
-        println!("\nPOST {url}");
+        writeln!(out, "\nPOST {url}")?;
         let run = RunOptions {
             requests: options.requests,
             duration_secs: options.duration_secs,
@@ -239,7 +273,7 @@ pub async fn run(options: ProfileOptions) -> Result<Option<Document>, Box<dyn Er
         .await
         {
             Ok(report) => {
-                report.print();
+                report.print(out)?;
                 Some(report)
             }
             Err(error) => {
@@ -253,16 +287,17 @@ pub async fn run(options: ProfileOptions) -> Result<Option<Document>, Box<dyn Er
         });
     }
 
-    println!("\nSleepAPI profile summary:");
+    writeln!(out, "\nSleepAPI profile summary:")?;
     for result in &results {
-        println!(
+        writeln!(
+            out,
             "  {} {}",
             if result.passed() { "PASS" } else { "FAIL" },
             result.route.unwrap()
-        );
+        )?;
     }
     let passed_count = results.iter().filter(|result| result.passed()).count();
-    println!("Endpoints passed: {passed_count}/{}", results.len());
+    writeln!(out, "Endpoints passed: {passed_count}/{}", results.len())?;
     Ok(Some(Document {
         kind: "profile",
         profile: Some(json!({

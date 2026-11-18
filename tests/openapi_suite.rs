@@ -453,6 +453,43 @@ fn preview_and_existing_report_refusal_send_no_operation_requests() {
 }
 
 #[test]
+#[cfg(unix)]
+fn suite_preview_saves_the_full_report_when_piped_to_head() {
+    let directory = TempDir::new();
+    let mut paths = json!({});
+    for id in 0..256 {
+        paths[format!("/item-{id:03}")] = json!({"get": {
+            "operationId": format!("item-{id:03}"),
+            "responses": {"204": {"description": "No content"}}
+        }});
+    }
+    let suite = directory.generate(&contract(paths));
+    let mut runner = Command::new(env!("CARGO_BIN_EXE_rusta-pitest"))
+        .current_dir(&directory.0)
+        .args(["suite", "run", &suite, "--output", "preview.json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let head = Command::new("head")
+        .args(["-n", "1"])
+        .stdin(runner.stdout.take().unwrap())
+        .output()
+        .unwrap();
+    assert_exit(&head, true);
+    assert_eq!(head.stdout, b"{\n");
+    assert_exit(&runner.wait_with_output().unwrap(), true);
+
+    let report = directory.read_json("preview.json");
+    assert_eq!(report["kind"], "suite");
+    assert_eq!(report["mode"], "preview");
+    assert_eq!(report["counts"]["selected"], 256);
+    let cases = report["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 256);
+    assert_eq!(cases.last().unwrap()["id"], "item-255");
+}
+
+#[test]
 fn authenticated_execution_preserves_base_prefix_escapes_fixture_and_redacts_reports() {
     let directory = TempDir::new();
     let suite = directory.generate(&widget_contract(true));
