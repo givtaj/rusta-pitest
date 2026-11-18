@@ -79,6 +79,15 @@ pub async fn run(options: RunOptions) -> Result<Value, String> {
         )
     );
     let fixtures = unique_bindings(&options.fixtures, "fixture")?;
+    let declared_slots: BTreeSet<_> = suite
+        .cases
+        .iter()
+        .flat_map(|case| &case.parameters)
+        .filter_map(|parameter| parameter.fixture.as_deref())
+        .collect();
+    if fixtures.keys().any(|name| !declared_slots.contains(name)) {
+        return Err("unknown fixture binding: use a fixture slot declared in the suite".into());
+    }
     let auth_env = unique_bindings(&options.auth_env, "authentication")?;
     if let Some(base) = &options.base_url {
         validate_base(base)?;
@@ -396,6 +405,18 @@ fn parse_parameter(raw: &str, validator: &Validator) -> Value {
         return string;
     }
     serde_json::from_str(raw).unwrap_or(string)
+}
+
+fn header_value_matches(raw: &str, validator: &Validator) -> bool {
+    if validator.is_valid(&Value::String(raw.to_owned())) {
+        return true;
+    }
+    // Quotes and escapes are literal header text. Only non-string scalar
+    // schemas need a second interpretation of the wire value.
+    match serde_json::from_str(raw) {
+        Ok(value @ (Value::Bool(_) | Value::Number(_) | Value::Null)) => validator.is_valid(&value),
+        _ => false,
+    }
 }
 
 fn authentication(
@@ -945,10 +966,10 @@ async fn execute(client: &Client, case: &Case, plan: Prepared) -> Value {
             match headers.get(&header.name) {
                 None => !header.required,
                 Some(value) => value.to_str().is_ok_and(|value| {
-                    header.validator.as_ref().is_none_or(|validator| {
-                        let parsed = parse_parameter(value, validator);
-                        !parsed.is_object() && !parsed.is_array() && validator.is_valid(&parsed)
-                    })
+                    header
+                        .validator
+                        .as_ref()
+                        .is_none_or(|validator| header_value_matches(value, validator))
                 }),
             }
         });

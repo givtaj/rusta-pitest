@@ -100,7 +100,10 @@ variables. Required path parameters always need fixture slots named
 resource exists. Fixture strings are validated first as strings, then as JSON
 primitives/arrays when the schema requires them. Other required parameters use
 bounded, schema-validated synthetic candidates; optional parameters are omitted
-unless a reviewed suite supplies a candidate or fixture binding.
+unless a reviewed suite supplies a candidate or fixture binding. Each
+`--fixture` name must match a parameter's `fixture` slot somewhere in the
+reviewed suite. Preview and execution reject unknown names before any requests.
+A binding for an unselected case may be left in place.
 
 The supported authentication schemes are HTTP bearer and API keys in headers
 or cookies. Security alternatives (OR) and combined requirements (AND) are
@@ -209,8 +212,9 @@ Response checks include:
   definitions for diagnostics.
 - Supported JSON media types, JSON syntax, and the declared body schema. A
   missing schema is reported as `not_documented`; it gives no body-shape claim.
-- Supported scalar response headers, including presence when required. Optional
-  absent headers do not fail. Content-Type comes from the response content map.
+- Supported scalar response headers, including presence when required. String
+  values are checked literally, including any quotation marks. Optional absent
+  headers do not fail. Content-Type comes from the response content map.
 - HEAD and bodyless statuses have no body-schema assertion. A 202 response
   checks only the immediate response, not eventual completion.
 
