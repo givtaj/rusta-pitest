@@ -380,3 +380,90 @@ analytically after drain, with omitted records included in `dropped_records`.
 capture. An interrupted run also sets top-level `interrupted: true`; even a
 fully retained prefix is not a complete uninterrupted run. Abrupt termination
 or failure to publish the report can still prevent an artifact from being saved.
+
+## Capacity sweeps
+
+The experimental `workload capacity` command runs a separate JSON plan for
+one GET or HEAD operation with one reusable actor credential snapshot. It
+uses the path, query, header, status, and response-schema rules above.
+Successful reads require a 2xx response that matches the optional exact
+status and response schema.
+
+Save this synthetic plan as `capacity.json` and use the localhost fixture
+at the top of this page.
+
+```json
+{
+  "capacity_version": 1,
+  "operation": "ready",
+  "actor": {},
+  "request": {"method": "GET", "path": "/query-ready", "expect_status": 200},
+  "warmup": {"duration_ms": 500, "rate_per_sec": 2},
+  "sustained": {"duration_ms": 1000, "rates_per_sec": [2, 4, 8]},
+  "bursts": {"sizes": [1, 2, 4]},
+  "max_in_flight": 8,
+  "timeout_ms": 1000,
+  "max_start_lag_ms": 50
+}
+```
+
+```sh
+cargo run --locked -- workload capacity capacity.json
+cargo run --locked --release -- workload capacity capacity.json \
+  --execute --base-url http://127.0.0.1:8001 --operation ready \
+  --output capacity.report.json
+```
+
+Preview sends no requests and resolves no credential values. Execution
+requires explicit selection of the operation and base URL. Unknown fields
+and duplicate JSON keys fail validation. The plan must list strictly increasing
+positive rates and burst sizes. Limits are 12 levels per sequence, 1,000
+requests/second, 128 client slots, and 1–120,000 ms per warmup or sustained
+trial. Burst sizes must fit within the configured client slots. The HTTP
+timeout is 1–10,000 ms and the start lag allowance is 1–1,000 ms. The worst
+case including confirmations may offer up to 100,000 requests and budget up
+to 20 minutes for arrival windows and bounded HTTP drains.
+
+Warmup uses fixed arrivals and drains fully before search starts. Its results
+are reported under `warmup` with `measured: false`. They are excluded from
+both sequences, their pass criteria, and the measured peak. Warmup failures are diagnostic. The same HTTP client is reused across
+all trials.
+
+Each sustained trial offers a fixed request rate over its arrival window.
+Late offers and offers without a client slot count as unsent. Check those
+reasons when the generator hits a limit during a trial. A burst
+releases its client tasks from a shared start gate and sends one request
+per task. Actual starts can differ by scheduler and network timing. Each
+trial drains before the next one starts. Ctrl-C stops further admission
+and drains admitted requests under their request timeouts, then saves an
+interrupted report when `--output` is set.
+
+A trial passes when every offer completes successfully and, if set,
+successful-request p95 latency is at or below `max_success_p95_ms`. Each
+sequence stops its search at the first failed trial or its configured
+ceiling, then runs two confirmations at its last passing search level, if
+one exists. A failed confirmation leaves that sequence without a repeatedly
+passing level. The sustained and burst sequences search independently.
+Execution exits zero when both sequences establish a repeatedly passing
+level and the report is saved successfully if requested.
+
+The JSON report uses `kind: workload_capacity` and `schema_version: 1`.
+For each sequence, `configured_ceiling` is its largest configured level.
+`first_failure` is null when no search trial failed.
+`highest_repeatedly_passing_level` requires both confirmations to pass and
+is null when the first level fails or any confirmation fails.
+Ordered trials report the ceiling and level, attempt type, the measured
+peak number of client requests in flight, status counts, counts with no
+HTTP status, and failure or unsent reasons. HTTP status counts include any
+observed status, including a status received before a response body failed.
+
+`successful_requests_per_sec` divides passing requests by the trial's
+elapsed time including drain. Sustained elapsed time includes the planned
+arrival window for ordinary completed trials. Burst elapsed time starts
+before releasing the group and ends at the last terminal attempt. Bursts
+measure a one-time group of requests. `successful_request_latency` and
+`all_attempt_latency` use the same start-to-terminal clock, with the latter
+including fast errors and timeouts. Neither distribution samples unsent
+offers. Approximate p50, p95, and p99 are reported in milliseconds. Observed
+in-flight counts measure the client from dispatch through terminal outcome.
+The results describe the tested target and conditions.

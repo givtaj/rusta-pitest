@@ -7,6 +7,8 @@ describes `kind: request` and `kind: profile`. OpenAPI suite reports use
 The authored workload runner, introduced in alpha.4, uses `schema_version: 2` and
 `kind: workload`; see [its report definitions](workloads.md#reports-and-thresholds).
 Do not parse its lifecycle counters as the version-1 benchmark metrics below.
+Capacity sweeps use schema version 1 with `kind: workload_capacity`. See the
+[capacity report fields](workloads.md#capacity-sweeps).
 
 Use `--output FILE` before or after a command to save one JSON document while
 keeping the normal terminal output. It works with `get`, `post`, `target`,

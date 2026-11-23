@@ -1,4 +1,5 @@
 mod bench;
+mod capacity;
 mod catalogue;
 mod cli;
 mod contract;
@@ -74,6 +75,22 @@ async fn run(cli: Cli, out: &mut impl Write) -> io::Result<ExitCode> {
             command: cli::WorkloadCommand::Run(options),
         }) => {
             return run_workload(options, destination, out).await;
+        }
+        Some(Command::Workload {
+            command: cli::WorkloadCommand::Capacity(options),
+        }) => {
+            let file = match prepare_report(destination) {
+                Ok(file) => file,
+                Err(code) => return Ok(code),
+            };
+            let execute = options.execute;
+            return match capacity::run(options).await {
+                Ok(report) => finish_json_report(&report, file, out, execute),
+                Err(error) => {
+                    eprintln!("Capacity workload failed: {error}");
+                    Ok(ExitCode::FAILURE)
+                }
+            };
         }
         Some(Command::Catalogue) => {
             catalogue::print();

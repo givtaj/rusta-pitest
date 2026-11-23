@@ -119,6 +119,9 @@ automatic authentication renewal. Execution requires `--execute`, an explicit
 See [workloads](docs/workloads.md) for a runnable localhost fixture, the complete
 plan, credential handling, sequence semantics, limits, and schema-v2 reports.
 
+The experimental [capacity sweep](docs/workloads.md#capacity-sweeps) previews a
+separate read-only plan with warmup, sustained rates, and synchronized bursts.
+
 From alpha.6, authored requests can also supply ordered `query` name/value
 pairs, including repeated names, empty values, and Unicode. Values are literal
 plan data, with bounded percent encoding and no automatic pagination or
@@ -379,7 +382,7 @@ source cleanliness (`null` in JSON), even inside an unrelated Git checkout.
 Official release binaries carry their tagged source revision and clean marker.
 The separate workload runner supports authored plans and static
 actor authentication. Automatic session renewal, target lifecycle management,
-warmup controls, and saved comparisons remain separate work.
+warmup controls for ordinary benchmarks, and saved comparisons remain separate work.
 
 Contributions and bug reports are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md)
 for the development workflow. Report suspected vulnerabilities through the
