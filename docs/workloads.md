@@ -426,8 +426,8 @@ to 20 minutes for arrival windows and bounded HTTP drains.
 
 Warmup uses fixed arrivals and drains fully before search starts. Its results
 are reported under `warmup` with `measured: false`. They are excluded from
-both sequences, their pass criteria, and the measured peak. Warmup failures are diagnostic. The same HTTP client is reused across
-all trials.
+both sequences, their pass criteria, and the measured peak. Warmup failures
+are diagnostic. The same HTTP client is reused across all trials.
 
 Each sustained trial offers a fixed request rate over its arrival window.
 Late offers and offers without a client slot count as unsent. Check those

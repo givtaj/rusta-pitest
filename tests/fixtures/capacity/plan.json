@@ -1,0 +1,38 @@
+{
+  "capacity_version": 1,
+  "operation": "read",
+  "actor": {
+    "headers_env": {
+      "Cookie": "RUSTA_CAPACITY_TEST_COOKIE"
+    }
+  },
+  "request": {
+    "method": "GET",
+    "path": "/synthetic-capacity-demo",
+    "expect_status": 200
+  },
+  "warmup": {
+    "duration_ms": 500,
+    "rate_per_sec": 2
+  },
+  "sustained": {
+    "duration_ms": 1000,
+    "rates_per_sec": [
+      2,
+      4,
+      20,
+      24
+    ]
+  },
+  "bursts": {
+    "sizes": [
+      1,
+      2,
+      6,
+      8
+    ]
+  },
+  "max_in_flight": 8,
+  "timeout_ms": 2000,
+  "max_start_lag_ms": 100
+}

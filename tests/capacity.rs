@@ -2,14 +2,15 @@ use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
+    ops::Range,
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use serde_json::{Value, json};
@@ -67,24 +68,35 @@ impl Drop for FixtureDir {
 
 #[derive(Default)]
 struct ServiceState {
-    arrivals: Vec<Instant>,
+    arrivals: u64,
     serving_successes: usize,
+    burst_released: Option<bool>,
+}
+
+struct SharedService {
+    state: Mutex<ServiceState>,
+    burst_gate: Option<Range<u64>>,
+    burst_arrived: Condvar,
 }
 
 struct Service {
     url: String,
-    state: Arc<Mutex<ServiceState>>,
+    shared: Arc<SharedService>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl Service {
-    fn new() -> Self {
+    fn new(burst_gate: Option<Range<u64>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let state = Arc::new(Mutex::new(ServiceState::default()));
-        let shared = state.clone();
+        let shared = Arc::new(SharedService {
+            state: Mutex::new(ServiceState::default()),
+            burst_gate,
+            burst_arrived: Condvar::new(),
+        });
+        let connections = shared.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
         let worker = thread::spawn(move || {
@@ -93,7 +105,7 @@ impl Service {
             while !stopping.load(Ordering::Relaxed) && clients.len() < 80 {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let shared = shared.clone();
+                        let shared = connections.clone();
                         clients.push(thread::spawn(move || serve(stream, shared)));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -108,14 +120,18 @@ impl Service {
         });
         Self {
             url,
-            state,
+            shared,
             stop,
             worker: Some(worker),
         }
     }
 
-    fn arrivals(&self) -> Vec<Instant> {
-        self.state.lock().unwrap().arrivals.clone()
+    fn arrivals(&self) -> u64 {
+        self.shared.state.lock().unwrap().arrivals
+    }
+
+    fn burst_released(&self) -> Option<bool> {
+        self.shared.state.lock().unwrap().burst_released
     }
 }
 
@@ -126,7 +142,7 @@ impl Drop for Service {
     }
 }
 
-fn serve(mut stream: TcpStream, shared: Arc<Mutex<ServiceState>>) {
+fn serve(mut stream: TcpStream, shared: Arc<SharedService>) {
     stream.set_nonblocking(false).unwrap();
     let timeout = Some(Duration::from_secs(2));
     stream.set_read_timeout(timeout).unwrap();
@@ -151,23 +167,43 @@ fn serve(mut stream: TcpStream, shared: Arc<Mutex<ServiceState>>) {
         }
     }
     let status = {
-        let mut state = shared.lock().unwrap();
-        state.arrivals.push(Instant::now());
-        if !expected_route || !expected_cookie {
+        let mut state = shared.state.lock().unwrap();
+        let arrival_index = state.arrivals;
+        state.arrivals += 1;
+        let status = if !expected_route || !expected_cookie {
             401
         } else if state.serving_successes >= 2 {
             503
         } else {
             state.serving_successes += 1;
             200
+        };
+        if let Some(burst) = &shared.burst_gate
+            && burst.contains(&arrival_index)
+        {
+            // Hold every reply until all six requests are outstanding. The
+            // timeout releases the handlers if the runner dispatches serially.
+            if state.arrivals == burst.end && state.burst_released.is_none() {
+                state.burst_released = Some(true);
+                shared.burst_arrived.notify_all();
+            }
+            let (mut state, _) = shared
+                .burst_arrived
+                .wait_timeout_while(state, Duration::from_secs(1), |state| {
+                    state.burst_released.is_none()
+                })
+                .unwrap();
+            if state.burst_released.is_none() {
+                state.burst_released = Some(false);
+                shared.burst_arrived.notify_all();
+            }
         }
+        status
     };
 
-    // Keep the rejected requests much faster while allowing time for the
-    // synchronized requests to reach the listener on a busy machine.
     if status == 200 {
         thread::sleep(Duration::from_millis(340));
-        shared.lock().unwrap().serving_successes -= 1;
+        shared.state.lock().unwrap().serving_successes -= 1;
     } else {
         thread::sleep(Duration::from_millis(40));
     }
@@ -253,7 +289,12 @@ fn assert_counts_and_rates(trial: &Value) -> u64 {
 #[test]
 fn capacity_sweeps_and_confirms_with_separate_success_latency() {
     let directory = FixtureDir::new();
-    let service = Service::new();
+    let sustained_levels = [2, 4, 20, 4, 4];
+    let burst_levels = [1, 2, 6, 2, 2];
+    // One warmup request, five one-second sustained trials, then two bursts.
+    let burst_start =
+        1 + sustained_levels.iter().sum::<u64>() + burst_levels[..2].iter().sum::<u64>();
+    let service = Service::new(Some(burst_start..burst_start + burst_levels[2]));
     let plan = directory.write_plan("plan.json", &plan());
     let report_path = directory.0.join("report.json");
     let output = capacity(&plan)
@@ -279,35 +320,35 @@ fn capacity_sweeps_and_confirms_with_separate_success_latency() {
     assert_eq!(report["warmup"]["measured"], false);
     assert_eq!(report["warmup"]["counts"]["offered"], 1);
     assert_eq!(report["warmup"]["counts"]["passed"], 1);
-    assert_trials(&report["sustained"], [2, 4, 20, 4, 4], 24);
-    assert_trials(&report["bursts"], [1, 2, 6, 2, 2], 8);
-
-    for sequence in [&report["sustained"], &report["bursts"]] {
-        let failing = &sequence["trials"][2];
-        let counts = &failing["counts"];
-        assert!(counts["by_status"]["503"].as_u64() > counts["by_status"]["200"].as_u64());
-        let median = |key| failing[key]["p50_ms"].as_f64().unwrap();
-        assert!(median("successful_request_latency") > median("all_attempt_latency") + 200.0);
-    }
-    assert_eq!(report["bursts"]["trials"][2]["peak_client_in_flight"], 6);
-    assert_eq!(report["peak_client_in_flight"], 6);
-
+    assert_trials(&report["sustained"], sustained_levels, 24);
+    assert_trials(&report["bursts"], burst_levels, 8);
     let sustained = report["sustained"]["trials"].as_array().unwrap();
     let bursts = report["bursts"]["trials"].as_array().unwrap();
+    let sustained_failure = &sustained[2];
+    let statuses = &sustained_failure["counts"]["by_status"];
+    assert!(statuses["503"].as_u64().unwrap() > statuses["200"].as_u64().unwrap());
+    let median = |key| sustained_failure[key]["p50_ms"].as_f64().unwrap();
+    assert!(median("successful_request_latency") > median("all_attempt_latency") + 200.0);
+    assert_eq!(service.burst_released(), Some(true));
+    assert_eq!(
+        bursts[2]["counts"]["by_status"],
+        json!({"200": 2, "503": 4})
+    );
+    assert_eq!(bursts[2]["peak_client_in_flight"], burst_levels[2]);
+
     let measured = sustained
         .iter()
         .chain(bursts)
         .map(assert_counts_and_rates)
         .sum::<u64>();
-    let arrivals = service.arrivals();
-    assert_eq!(arrivals.len() as u64, measured + 1);
-    let first_failing_burst =
-        1 + sustained.iter().map(assert_counts_and_rates).sum::<u64>() + 1 + 2;
-    let first_failing_burst = first_failing_burst as usize;
-    assert!(
-        arrivals[first_failing_burst + 5] - arrivals[first_failing_burst]
-            < Duration::from_millis(170)
-    );
+    assert_eq!(service.arrivals(), measured + 1);
+    let measured_peak = sustained
+        .iter()
+        .chain(bursts)
+        .map(|trial| trial["peak_client_in_flight"].as_u64().unwrap())
+        .max()
+        .unwrap();
+    assert_eq!(report["peak_client_in_flight"], measured_peak);
 
     let serialized = String::from_utf8(output.stdout).unwrap();
     for private in [COOKIE, COOKIE_ENV, REQUEST_PATH, service.url.as_str()] {
@@ -318,7 +359,7 @@ fn capacity_sweeps_and_confirms_with_separate_success_latency() {
 #[test]
 fn preview_and_invalid_preflight_send_no_requests() {
     let directory = FixtureDir::new();
-    let service = Service::new();
+    let service = Service::new(None);
     let mut plan_value = plan();
     let valid = directory.write_plan("valid.json", &plan_value);
     let preview = capacity(&valid)
@@ -329,7 +370,7 @@ fn preview_and_invalid_preflight_send_no_requests() {
     let preview = read_report(&preview);
     assert_eq!(preview["executed"], false);
     assert_eq!(preview["passed"], Value::Null);
-    assert!(service.arrivals().is_empty());
+    assert_eq!(service.arrivals(), 0);
 
     plan_value["bursts"]["sizes"] = json!([1, 2, 9]);
     let invalid = directory.write_plan("invalid.json", &plan_value);
@@ -346,14 +387,14 @@ fn preview_and_invalid_preflight_send_no_requests() {
             .output()
             .unwrap();
         assert!(!output.status.success());
-        assert!(service.arrivals().is_empty());
+        assert_eq!(service.arrivals(), 0);
     }
 }
 
 #[test]
 fn capacity_first_failure_with_no_passing_level_has_no_confirmations() {
     let directory = FixtureDir::new();
-    let service = Service::new();
+    let service = Service::new(None);
     let mut plan_value = plan();
     plan_value["sustained"]["duration_ms"] = json!(100);
     plan_value["request"]["expect_status"] = json!(204);
@@ -385,5 +426,5 @@ fn capacity_first_failure_with_no_passing_level_has_no_confirmations() {
         assert_eq!(trial["successful_request_latency"]["p50_ms"], Value::Null);
         assert_eq!(trial["all_attempt_latency"]["samples"], 1);
     }
-    assert_eq!(service.arrivals().len(), 3);
+    assert_eq!(service.arrivals(), 3);
 }

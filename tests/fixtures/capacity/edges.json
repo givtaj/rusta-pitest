@@ -1,0 +1,149 @@
+{
+  "runner": {
+    "build_profile": "debug",
+    "git_revision": "bc1f3013f5059f1a8b98e081dd5477ef477b45fd",
+    "name": "rusta-pitest",
+    "rustc_version": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "source_dirty": false,
+    "target": "aarch64-apple-darwin",
+    "version": "0.1.0-alpha.7"
+  },
+  "first_sustained_level_failed_with_independent_burst_sweep": {
+    "server_reads": 9,
+    "sustained": {
+      "first_failure": 1,
+      "highest_repeatedly_passing_level": null,
+      "configured_ceiling": 2,
+      "attempts": [
+        {
+          "attempt": "search",
+          "confirmation": null,
+          "level": 1,
+          "passed": false
+        }
+      ]
+    },
+    "bursts": {
+      "first_failure": null,
+      "highest_repeatedly_passing_level": 2,
+      "configured_ceiling": 2,
+      "attempts": [
+        {
+          "attempt": "search",
+          "confirmation": null,
+          "level": 1,
+          "passed": true
+        },
+        {
+          "attempt": "search",
+          "confirmation": null,
+          "level": 2,
+          "passed": true
+        },
+        {
+          "attempt": "confirmation",
+          "confirmation": 1,
+          "level": 2,
+          "passed": true
+        },
+        {
+          "attempt": "confirmation",
+          "confirmation": 2,
+          "level": 2,
+          "passed": true
+        }
+      ]
+    }
+  },
+  "first_confirmation_failed_and_second_still_executed": {
+    "server_reads": 14,
+    "sustained": {
+      "first_failure": 9,
+      "highest_repeatedly_passing_level": null,
+      "configured_ceiling": 9,
+      "attempts": [
+        {
+          "attempt": "search",
+          "confirmation": null,
+          "level": 1,
+          "passed": true
+        },
+        {
+          "attempt": "search",
+          "confirmation": null,
+          "level": 2,
+          "passed": true
+        },
+        {
+          "attempt": "search",
+          "confirmation": null,
+          "level": 9,
+          "passed": false
+        },
+        {
+          "attempt": "confirmation",
+          "confirmation": 1,
+          "level": 2,
+          "passed": false
+        },
+        {
+          "attempt": "confirmation",
+          "confirmation": 2,
+          "level": 2,
+          "passed": true
+        }
+      ]
+    }
+  },
+  "sigint_during_sustained_stage": {
+    "server_reads": 2,
+    "reported_unsent_offers": 1,
+    "bursts_started": false,
+    "sustained": {
+      "first_failure": null,
+      "highest_repeatedly_passing_level": null,
+      "configured_ceiling": 2,
+      "attempts": [
+        {
+          "attempt": "search",
+          "confirmation": null,
+          "level": 1,
+          "passed": false
+        }
+      ]
+    }
+  },
+  "sigint_during_active_burst_drained_current_requests": {
+    "server_reads": 6,
+    "first_burst_responses": {
+      "200": 2
+    },
+    "bursts": {
+      "first_failure": null,
+      "highest_repeatedly_passing_level": null,
+      "configured_ceiling": 3,
+      "attempts": [
+        {
+          "attempt": "search",
+          "confirmation": null,
+          "level": 2,
+          "passed": false
+        }
+      ]
+    }
+  },
+  "success_p95_gate_rejects_slow_200s_in_measured_stages": {
+    "threshold_ms": 15,
+    "server_reads": 3,
+    "sustained": {
+      "successful_request_p95_ms": 211.455,
+      "successful_http_responses": 1,
+      "first_failure": 1
+    },
+    "bursts": {
+      "successful_request_p95_ms": 210.943,
+      "successful_http_responses": 1,
+      "first_failure": 1
+    }
+  }
+}
