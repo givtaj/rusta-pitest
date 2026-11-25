@@ -160,24 +160,29 @@ fn serve(mut stream: TcpStream, requests: Arc<Mutex<Vec<Request>>>) {
     if reader.read_exact(&mut body).is_err() {
         return;
     }
-    requests.lock().unwrap().push(Request {
+    let request = Request {
         method: method.clone(),
         path: path.clone(),
         headers,
         body,
-    });
+    };
+    let fixture_response = fixture_reply(&request);
+    requests.lock().unwrap().push(request);
     let route = path.split('?').next().unwrap();
     if route.ends_with("/disconnect") {
         return;
     }
-    let status = if route.ends_with("/denied") {
+    let default_status = if route.ends_with("/denied") {
         401
     } else if route.ends_with("/failure") {
         503
     } else {
         200
     };
-    let body = br#"{"ok":true}"#;
+    let (status, body) = fixture_response.as_ref().map_or(
+        (default_status, br#"{"ok":true}"#.as_slice()),
+        |(status, body)| (*status, body.as_slice()),
+    );
     if write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).is_err() { return; }
     let _ = stream.flush();
     if route.ends_with("/slow") || route.ends_with("/write") {
@@ -862,6 +867,316 @@ fn query_support_keeps_explicit_selection_and_raw_path_query_restrictions() {
     let invalid_path = command(&temp, &p, Some(&server)).output().unwrap();
     assert!(!invalid_path.status.success());
     assert!(server.seen().is_empty());
+}
+
+struct FixtureActor {
+    id: &'static str,
+    cookie: &'static str,
+    case_id: &'static str,
+    encoded_case: &'static str,
+    filter: &'static str,
+    encoded_filter: &'static str,
+    tenants: [&'static str; 2],
+}
+
+const FIXTURE_ACTORS: [FixtureActor; 2] = [
+    FixtureActor {
+        id: "a",
+        cookie: "session=fixture-cookie-a-private",
+        case_id: "fixture-case-a-private café+%?#",
+        encoded_case: "fixture-case-a-private%20caf%C3%A9%2B%25%3F%23",
+        filter: "fixture-filter-a-private +/%?=#&☃",
+        encoded_filter: "fixture-filter-a-private%20%2B%2F%25%3F%3D%23%26%E2%98%83",
+        tenants: [
+            "fixture-tenant-a-low-private",
+            "fixture-tenant-a-high-private",
+        ],
+    },
+    FixtureActor {
+        id: "b",
+        cookie: "session=fixture-cookie-b-private",
+        case_id: "fixture-case-b-private 雪+%?#",
+        encoded_case: "fixture-case-b-private%20%E9%9B%AA%2B%25%3F%23",
+        filter: "fixture-filter-b-private +/%?=#&ß",
+        encoded_filter: "fixture-filter-b-private%20%2B%2F%25%3F%3D%23%26%C3%9F",
+        tenants: [
+            "fixture-tenant-b-low-private",
+            "fixture-tenant-b-high-private",
+        ],
+    },
+];
+
+impl FixtureActor {
+    fn env(&self, kind: &str) -> String {
+        format!(
+            "RUSTA_TEST_PRIVATE_FIXTURE_{}_{kind}",
+            self.id.to_ascii_uppercase()
+        )
+    }
+
+    fn bindings(&self) -> [(String, String); 5] {
+        [
+            (self.env("COOKIE"), self.cookie.to_owned()),
+            (
+                self.env("CASE"),
+                serde_json::to_string(self.case_id).unwrap(),
+            ),
+            (
+                self.env("FILTER"),
+                serde_json::to_string(self.filter).unwrap(),
+            ),
+            (
+                self.env("TENANTS"),
+                serde_json::to_string(&self.tenants).unwrap(),
+            ),
+            (self.env("ACTIVE"), "true".to_owned()),
+        ]
+    }
+
+    fn target(&self) -> String {
+        format!(
+            "/fixture-cases/{}?tag=literal%2Btag&tag={}&empty=",
+            self.encoded_case, self.encoded_filter
+        )
+    }
+}
+
+fn fixture_reply(request: &Request) -> Option<(u16, Vec<u8>)> {
+    if !request.path.starts_with("/fixture-cases/") {
+        return None;
+    }
+    let cookie = request.headers.get("cookie").map(String::as_str);
+    let Some(identity) = FIXTURE_ACTORS
+        .iter()
+        .find(|actor| Some(actor.cookie) == cookie)
+    else {
+        return Some((401, b"{}".to_vec()));
+    };
+    let [first, second] = identity.tenants;
+    let body = json!({"tenants":[second, first],"identity/active~flag":true,"revision":7});
+    Some((200, serde_json::to_vec(&body).unwrap()))
+}
+
+fn actor_fixture_plan() -> Value {
+    let mut p = plan();
+    p["requests"] = json!({
+        "setup":{"method":"GET","path":"/setup"},
+        "read":{
+            "method":"GET",
+            "path":{"segments":["fixture-cases",{"fixture":"case"}]},
+            "query":[
+                {"name":"tag","value":"literal+tag"},
+                {"name":"tag","value":{"fixture":"filter"}},
+                {"name":"empty","value":""}
+            ],
+            "expect_status":200,
+            "response_schema":{
+                "type":"object",
+                "required":["tenants","identity/active~flag","revision"],
+                "properties":{
+                    "tenants":{"type":"array","items":{"type":"string"}},
+                    "identity/active~flag":{"type":"boolean"},
+                    "revision":{"const":7}
+                }
+            },
+            "expect_fields":[
+                {"pointer":"/tenants","equals_set":{"fixture":"tenants"}},
+                {"pointer":"/identity~1active~0flag","equals":{"fixture":"active"}}
+            ]
+        }
+    });
+    for actor in &FIXTURE_ACTORS {
+        p["actors"][actor.id] = json!({
+            "headers_env":{"Cookie":actor.env("COOKIE")},
+            "fixtures":{
+                "case":{"env":actor.env("CASE"),"type":"string"},
+                "filter":{"env":actor.env("FILTER"),"type":"string"},
+                "tenants":{"env":actor.env("TENANTS"),"type":"array"},
+                "active":{"env":actor.env("ACTIVE"),"type":"boolean"}
+            }
+        });
+    }
+    p["setup"] = json!([{"actor":"a","request":"setup"}]);
+    p["groups"] = json!({
+        "a_reads":{"actors":["a"],"max_in_flight":1,"requests":["read"]},
+        "b_reads":{"actors":["b"],"max_in_flight":1,"requests":["read"]}
+    });
+    p["phases"] = json!([{"name":"normal","duration_ms":300,"rates":{"a_reads":1,"b_reads":1}}]);
+    p["max_in_flight"] = json!(2);
+    p
+}
+
+fn assert_fixture_redacted(output: &Output, saved: &str) {
+    for text in [
+        String::from_utf8_lossy(&output.stdout).as_ref(),
+        String::from_utf8_lossy(&output.stderr).as_ref(),
+        saved,
+    ] {
+        for actor in &FIXTURE_ACTORS {
+            for (binding, _) in actor.bindings() {
+                assert!(!text.contains(&binding), "fixture binding leaked");
+            }
+            for material in [
+                actor.cookie.strip_prefix("session=").unwrap(),
+                actor.case_id.split_once(' ').unwrap().0,
+                actor.filter.split_once(' ').unwrap().0,
+                actor.tenants[0],
+                actor.tenants[1],
+                "invalid-tenant-fixture-private",
+            ] {
+                assert!(!text.contains(material), "fixture value leaked");
+            }
+        }
+    }
+}
+
+#[test]
+fn actor_fixtures_check_tenant_sets_and_typed_fields_for_each_measured_read() {
+    let [alice, bob] = &FIXTURE_ACTORS;
+    for (identities, check_fields, alice_active, passes) in [
+        ([alice, bob], true, true, [true, true]),
+        ([bob, bob], true, true, [false, true]),
+        ([bob, alice], true, true, [false, false]),
+        ([bob, alice], false, true, [true, true]),
+        ([alice, bob], true, false, [false, true]),
+    ] {
+        let temp = Temp::new();
+        let server = Server::new();
+        let mut p = actor_fixture_plan();
+        if !check_fields {
+            p["requests"]["read"]
+                .as_object_mut()
+                .unwrap()
+                .remove("expect_fields");
+        }
+        let mut run = command(&temp, &p, Some(&server));
+        for (actor, identity) in FIXTURE_ACTORS.iter().zip(identities) {
+            run.envs(actor.bindings())
+                .env(actor.env("COOKIE"), identity.cookie);
+        }
+        let output = run
+            .env(alice.env("ACTIVE"), alice_active.to_string())
+            .args(["--output", "result.json"])
+            .output()
+            .unwrap();
+        let saved = fs::read_to_string(temp.0.join("result.json")).unwrap();
+        assert_fixture_redacted(&output, &saved);
+        assert_eq!(output.stdout, saved.as_bytes());
+        let r = report(output, passes == [true, true]);
+        reconcile(&r);
+        let passed = passes.into_iter().filter(|pass| *pass).count() as u64;
+        assert_eq!(r["counts"]["offered"], 2);
+        assert_eq!(r["counts"]["complete_http_responses"], 2);
+        assert_eq!(r["counts"]["passed"], passed);
+        assert_eq!(r["counts"]["failed"], 2 - passed);
+        assert_eq!(r["evidence"]["complete"], true);
+        let records = r["evidence"]["records"].as_array().unwrap();
+        assert_eq!(records.len(), 2);
+        for (actor, passed) in FIXTURE_ACTORS.iter().zip(passes) {
+            let record = records
+                .iter()
+                .find(|record| record["actor"] == actor.id)
+                .unwrap();
+            assert_eq!(record["status"], 200);
+            let expected = if passed {
+                "passed"
+            } else {
+                "response_field_mismatch"
+            };
+            assert_eq!(record["reason"], expected);
+        }
+        let seen = server.seen();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0].path, "/setup");
+        for (actor, identity) in FIXTURE_ACTORS.iter().zip(identities) {
+            let request = seen
+                .iter()
+                .find(|request| request.path == actor.target())
+                .unwrap();
+            assert_eq!(request.method, "GET");
+            assert_eq!(request.headers["cookie"], identity.cookie);
+        }
+    }
+}
+
+#[test]
+fn actor_fixture_preview_is_private_and_needs_no_environment() {
+    let temp = Temp::new();
+    let server = Server::new();
+    let mut preview = command(&temp, &actor_fixture_plan(), None);
+    for actor in &FIXTURE_ACTORS {
+        for (binding, _) in actor.bindings() {
+            preview.env_remove(binding);
+        }
+    }
+    let output = preview
+        .args([
+            "--base-url",
+            &server.url,
+            "--operation",
+            "read",
+            "--operation",
+            "setup",
+            "--output",
+            "preview.json",
+        ])
+        .output()
+        .unwrap();
+    let saved = fs::read_to_string(temp.0.join("preview.json")).unwrap();
+    assert_fixture_redacted(&output, &saved);
+    assert_eq!(output.stdout, saved.as_bytes());
+    let r = report(output, true);
+    assert_eq!(r["executed"], false);
+    assert_eq!(r["runtime_secrets_loaded"], false);
+    assert_eq!(r["ready"], true);
+    assert!(server.seen().is_empty());
+}
+
+#[test]
+fn invalid_measured_actor_fixtures_block_even_valid_setup() {
+    let temp = Temp::new();
+    let server = Server::new();
+    let p = actor_fixture_plan();
+    let tenant_binding = FIXTURE_ACTORS[1].env("TENANTS");
+    for value in [
+        None,
+        Some(r#""invalid-tenant-fixture-private""#),
+        Some(r#"["invalid-tenant-fixture-private",]"#),
+    ] {
+        let mut run = command(&temp, &p, Some(&server));
+        for actor in &FIXTURE_ACTORS {
+            run.envs(actor.bindings());
+        }
+        if let Some(value) = value {
+            run.env(&tenant_binding, value);
+        } else {
+            run.env_remove(&tenant_binding);
+        }
+        let output = run.args(["--output", "invalid.json"]).output().unwrap();
+        assert!(!output.status.success());
+        assert!(!temp.0.join("invalid.json").exists());
+        assert_fixture_redacted(&output, "");
+        assert!(server.seen().is_empty());
+    }
+}
+
+#[test]
+fn actor_fixture_preview_rejects_unknown_references_and_invalid_pointers() {
+    let temp = Temp::new();
+    let mut unknown = actor_fixture_plan();
+    unknown["actors"]["b"]["fixtures"]
+        .as_object_mut()
+        .unwrap()
+        .remove("filter");
+    let mut wrong_type = actor_fixture_plan();
+    wrong_type["actors"]["b"]["fixtures"]["filter"]["type"] = json!("array");
+    let mut invalid_pointer = actor_fixture_plan();
+    invalid_pointer["requests"]["read"]["expect_fields"][1]["pointer"] = json!("/bad~2escape");
+    for invalid in [unknown, wrong_type, invalid_pointer] {
+        let output = command(&temp, &invalid, None).output().unwrap();
+        assert!(!output.status.success());
+        assert_fixture_redacted(&output, "");
+    }
 }
 
 #[cfg(unix)]

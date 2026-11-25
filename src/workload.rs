@@ -1,6 +1,6 @@
 //! Reviewed, bounded open-loop workloads. Existing benchmark/suite semantics stay separate.
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fs::File,
     future::Future,
     io::Read,
@@ -777,20 +777,23 @@ fn prepare(plan: &Plan, options: &Options) -> Result<Prepared, String> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(std::path::Path::new("."));
-    pairs
-        .into_iter()
-        .map(|(actor, request)| {
-            let prepared = workload_http::prepare(
-                base,
-                &plan.actors[&actor],
-                &plan.requests[&request],
-                root,
-                options.execute,
-                options.allow_writes || !options.execute,
-            )?;
-            Ok(((actor, request), Arc::new(prepared)))
-        })
-        .collect()
+    let mut actors = BTreeMap::new();
+    let mut prepared = Prepared::new();
+    for (actor, request) in pairs {
+        let actor_bindings = match actors.entry(actor.clone()) {
+            Entry::Vacant(entry) => entry.insert(plan.actors[&actor].bind(options.execute)?),
+            Entry::Occupied(entry) => entry.into_mut(),
+        };
+        let operation = workload_http::prepare(
+            base,
+            actor_bindings,
+            &plan.requests[&request],
+            root,
+            options.allow_writes || !options.execute,
+        )?;
+        prepared.insert((actor, request), Arc::new(operation));
+    }
+    Ok(prepared)
 }
 
 fn cursors(plan: &Plan) -> Vec<Cursor> {
@@ -1532,12 +1535,7 @@ mod tests {
             validate(&plan).unwrap_err(),
             "actors_must_belong_to_one_group"
         );
-        plan.actors.insert(
-            "b".into(),
-            Actor {
-                headers_env: BTreeMap::new(),
-            },
-        );
+        plan.actors.insert("b".into(), Actor::default());
         plan.groups.get_mut("canary").unwrap().actors = vec!["b".into()];
         plan.max_in_flight = 1;
         assert_eq!(
