@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.0-alpha.8 — 2026-11-25
+
+- Add `workload capacity` to find a repeatedly passing request rate and burst
+  size for one actor and one GET or HEAD operation. Preview the plan without
+  sending traffic. Execution requires an explicit base URL and operation.
+- Exclude warmup, stop each search independently at its first failure or
+  configured ceiling, and repeat the last passing level twice. Plans can
+  require a maximum p95 latency for successful reads.
+- Report status counts, unsent reasons, peak client requests in flight, and
+  successful reads per second through drain. Separate successful-read latency
+  from latency across all attempts so fast errors are visible.
+- Update the locked `url` dependency to 2.5.9 and `form_urlencoded` to 1.2.3.
+
+See the [alpha.8 release notes](docs/releases/v0.1.0-alpha.8.md) for the
+report format and a bounded loopback example.
+
 ## 0.1.0-alpha.7 — 2026-11-18
 
 - Reject unknown `--fixture` names during OpenAPI suite preflight, before any

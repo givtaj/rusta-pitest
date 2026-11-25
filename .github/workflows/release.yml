@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing version tag to build (for example v0.1.0-alpha.7)
+        description: Existing version tag to build (for example v0.1.0-alpha.8)
         required: true
         type: string
 
@@ -182,6 +182,18 @@ jobs:
               assert query_preview['workload_version'] == 1
               assert query_preview['executed'] is False and query_preview['runtime_secrets_loaded'] is False
               assert query_preview['passed'] is None and query_preview['planned_requests'] == 1
+          if Path('src/capacity.rs').is_file():
+              report_path = output / 'capacity.report.json'
+              subprocess.run(['python3', 'tests/fixtures/capacity/verify.py',
+                              str(unpacked / name / 'rusta-pitest'), str(report_path)], check=True)
+              result = json.loads(report_path.read_text())
+              runner = result['runner']
+              assert all(runner[field] == provenance[field] for field in ('version', 'git_revision', 'target'))
+              assert runner['source_dirty'] is False
+              rate = result['sustained']['highest_repeatedly_passing_level']
+              burst = result['bursts']['highest_repeatedly_passing_level']
+              print(f"Packaged capacity fixture passed on {runner['target']} at {runner['git_revision']} "
+                    f"with confirmed rate {rate}/s and burst {burst}.")
           PY
 
       - name: Upload verified release artifacts
