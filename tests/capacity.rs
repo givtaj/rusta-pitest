@@ -311,8 +311,13 @@ fn capacity_sweeps_and_confirms_with_separate_success_latency() {
         .output()
         .unwrap();
     let report = read_report(&output);
-    let saved: Value = serde_json::from_reader(File::open(report_path).unwrap()).unwrap();
-    assert_eq!(saved, report);
+    let mut saved = Vec::new();
+    File::open(report_path)
+        .unwrap()
+        .take(output.stdout.len() as u64 + 1)
+        .read_to_end(&mut saved)
+        .unwrap();
+    assert!(saved == output.stdout, "saved report differs from stdout");
     assert_eq!(report["kind"], "workload_capacity");
     assert_eq!(report["executed"], true);
     assert_eq!(report["interrupted"], false);
