@@ -89,6 +89,8 @@ pub enum SuiteCommand {
 pub enum WorkloadCommand {
     /// Preview by default; execution requires an explicit target and operation selection
     Run(WorkloadOptions),
+    /// Preview or execute a bounded capacity sweep for one read operation
+    Capacity(CapacityOptions),
 }
 
 #[derive(Args)]
@@ -104,6 +106,20 @@ pub struct WorkloadOptions {
     /// Permit selected POST/PUT/PATCH/DELETE operations after reviewing their bodies
     #[arg(long)]
     pub allow_writes: bool,
+}
+
+#[derive(Args)]
+pub struct CapacityOptions {
+    pub plan: std::path::PathBuf,
+    /// Send traffic after preflight
+    #[arg(long)]
+    pub execute: bool,
+    /// Explicit API base URL, including an optional path prefix
+    #[arg(long, value_parser = parse_url)]
+    pub base_url: Option<Url>,
+    /// Select the plan's read operation
+    #[arg(long)]
+    pub operation: Option<String>,
 }
 
 #[derive(Args)]

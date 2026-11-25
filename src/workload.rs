@@ -215,7 +215,7 @@ impl Metrics {
     }
 }
 
-fn hist_json(hist: &Histogram<u64>, maximum_us: u64) -> Value {
+pub(crate) fn hist_json(hist: &Histogram<u64>, maximum_us: u64) -> Value {
     if hist.is_empty() {
         return json!({"samples":0,"p50_ms":null,"p95_ms":null,"p99_ms":null,"max_ms":null});
     }
@@ -537,7 +537,7 @@ fn offset_ms(at: Instant, origin: Instant) -> f64 {
     at.saturating_duration_since(origin).as_secs_f64() * 1000.0
 }
 
-fn safe_id(value: &str) -> bool {
+pub(crate) fn safe_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
         && value
@@ -545,7 +545,7 @@ fn safe_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-fn offers(duration_ms: u64, rate: u32) -> u64 {
+pub(crate) fn offers(duration_ms: u64, rate: u32) -> u64 {
     (duration_ms * u64::from(rate)).div_ceil(1000)
 }
 
@@ -557,15 +557,18 @@ fn cycle_count(end: u64, length: u64, index: u64) -> u64 {
     }
 }
 
-fn load(path: &std::path::Path) -> Result<Plan, String> {
+pub(crate) fn load_plan_json(path: &std::path::Path) -> Result<Value, String> {
     let mut bytes = Vec::new();
     File::open(path)
         .map_err(|_| "cannot_open_workload")?
         .take(MAX_PLAN_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| "cannot_read_workload")?;
-    let value = crate::strict_json::parse_json_with_limit(&bytes, MAX_PLAN_BYTES as usize)?;
-    serde_json::from_value(value).map_err(|_| "invalid_workload_structure".into())
+    crate::strict_json::parse_json_with_limit(&bytes, MAX_PLAN_BYTES as usize)
+}
+
+fn load(path: &std::path::Path) -> Result<Plan, String> {
+    serde_json::from_value(load_plan_json(path)?).map_err(|_| "invalid_workload_structure".into())
 }
 
 fn validate(plan: &Plan) -> Result<(), String> {
@@ -1035,7 +1038,7 @@ fn evaluate(threshold: &Threshold, metrics: &Metrics) -> Value {
         "passed":enough&&actual<=threshold.maximum,"reason":if !enough {"insufficient_samples"} else if actual>threshold.maximum {"maximum_exceeded"} else {"passed"}})
 }
 
-fn runner_metadata() -> Value {
+pub(crate) fn runner_metadata() -> Value {
     let revision = env!("RUSTA_GIT_REVISION");
     json!({
         "name":env!("CARGO_PKG_NAME"),"version":env!("CARGO_PKG_VERSION"),
