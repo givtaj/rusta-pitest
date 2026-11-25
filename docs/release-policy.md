@@ -64,6 +64,11 @@ must remain nonexecuting, and plans omitting queries must keep their existing
 behavior. The complete synthetic query example must be packaged and previewable.
 This alpha.6 addition retains workload version 1 and report schema version 2.
 
+For releases with `workload capacity`, run the extracted executable on each
+supported platform against the bounded two-slot loopback fixture. Verify the
+first failing and confirmed levels for sustained reads and for bursts, and
+identify the platform and release revision in the evidence.
+
 From alpha.5 onward, built and extracted binaries must also reject decoded YAML
 alias expansion beyond the configured input budget and excessive schema reference
 expansion before request execution. Small supported inputs must remain usable;
