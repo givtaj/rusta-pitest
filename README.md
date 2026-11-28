@@ -162,11 +162,16 @@ The experimental [capacity sweep](docs/workloads.md#capacity-sweeps) previews a
 separate read-only plan with warmup, sustained rates, and synchronized bursts.
 
 From alpha.6, authored requests can also supply ordered `query` name/value
-pairs, including repeated names, empty values, and Unicode. Values are literal
-plan data, with bounded percent encoding and no automatic pagination or
-environment interpolation. See [structured query parameters](docs/workloads.md#structured-query-parameters)
-and the [complete synthetic example](examples/workload-query.json). Earlier
-releases reject this field.
+pairs, including repeated names, empty values, and Unicode. Literal values use
+bounded percent encoding without environment interpolation or automatic
+pagination. Earlier releases reject the query field. See
+[structured query parameters](docs/workloads.md#structured-query-parameters)
+and the [complete synthetic example](examples/workload-query.json).
+
+In source builds with [private actor fixtures](docs/workloads.md#private-actor-fixtures),
+each actor can bind typed values for path segments, query values, and expected
+response fields. This lets the same read check each actor’s expected tenant set
+even when both credentials return HTTP 200.
 
 From alpha.4, OpenAPI commands also accept bounded larger inputs:
 `openapi generate --max-input-bytes` defaults to 1 MiB, its

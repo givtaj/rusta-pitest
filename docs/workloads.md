@@ -234,17 +234,22 @@ to 8 KiB, with a combined limit of 64 KiB per actor.
 The object `{"fixture":"binding"}` refers to a binding on the actor selected for
 that request. Use references in structured path segments, query values, and
 `expect_fields`. Path segments and query values accept string, integer, number,
-and boolean fixtures. The runner converts them to raw text and encodes each
-segment or query value once. Structured path segments must be nonempty and
-cannot contain slashes, backslashes, ASCII control characters, `.` or `..` as a
-complete segment. Literal path strings and literal query values keep their
+and boolean fixtures. JSON numbers used in URLs retain their original numeric
+spelling. The runner encodes each segment or query value once. Each structured
+path segment must be nonempty and cannot contain a slash, backslash, or ASCII
+control character. The segments `.` and `..` are also rejected. Literal path strings and literal query values keep their
 existing behavior. Binaries built before fixture support reject the new syntax.
 
 Each field assertion uses a JSON Pointer. `equals` compares the JSON value at
 that pointer to the fixture value. `equals_set` compares arrays as unordered
-sets of up to 256 scalars, with duplicates rejected in either array. Each
-request allows up to 32 assertions, with pointers limited to 1,024 bytes and
-32 segments. Field assertions apply alongside an optional `response_schema`.
+sets of up to 256 scalars, with duplicates rejected in either array.
+Numeric values in expected fields, including nested values and set members,
+must be integer tokens from `-9223372036854775808` through
+`18446744073709551615`. Preflight rejects out-of-range integers, fractions,
+and exponential notation in expectations to prevent rounded values from
+matching. For larger or decimal identifiers, compare JSON strings on both
+sides. Each request allows up to 32 assertions, with pointers limited to
+1,024 bytes and 32 segments. Field assertions apply alongside an optional `response_schema`.
 A missing or mismatched field fails with `response_field_mismatch`. Fixture
 values and environment-variable names stay out of runner reports and diagnostics.
 Paths and queries still go to the target and may appear in its access logs.

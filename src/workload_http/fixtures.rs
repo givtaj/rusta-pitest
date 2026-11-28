@@ -172,6 +172,8 @@ pub(super) struct BoundFixtures(BTreeMap<String, BoundFixture>);
 struct BoundFixture {
     kind: FixtureKind,
     value: Option<Arc<Value>>,
+    request_number: Option<String>,
+    contains_non_integer_numbers: bool,
 }
 
 impl BoundFixtures {
@@ -199,7 +201,7 @@ impl BoundFixtures {
                 return Err("fixture_name_invalid".into());
             }
             validate_env_name(&declaration.env)?;
-            let value = if execute {
+            let (value, request_number) = if execute {
                 let input =
                     resolve(&declaration.env).ok_or("fixture_environment_missing_or_invalid")?;
                 if input.len() > MAX_FIXTURE_VALUE_BYTES {
@@ -213,15 +215,22 @@ impl BoundFixtures {
                 if !declaration.kind.accepts(&value) {
                     return Err("fixture_value_type_mismatch".into());
                 }
-                Some(Arc::new(value))
+                // Preserve the validated wire token rather than re-serializing a rounded float.
+                let request_number = (declaration.kind == FixtureKind::Number)
+                    .then(|| input.trim_matches([' ', '\t', '\n', '\r']).to_owned());
+                (Some(Arc::new(value)), request_number)
             } else {
-                None
+                (None, None)
             };
+            let contains_non_integer_numbers =
+                value.as_deref().is_some_and(contains_non_integer_number);
             fixtures.insert(
                 name.clone(),
                 BoundFixture {
                     kind: declaration.kind,
                     value,
+                    request_number,
+                    contains_non_integer_numbers,
                 },
             );
         }
@@ -238,6 +247,9 @@ impl BoundFixtures {
         let fixture = self.get(reference)?;
         if !fixture.kind.is_request_scalar() {
             return Err("fixture_request_scalar_required".into());
+        }
+        if let Some(number) = &fixture.request_number {
+            return Ok(Some(Cow::Borrowed(number)));
         }
         Ok(match fixture.value.as_deref() {
             None => None,
@@ -257,6 +269,9 @@ impl BoundFixtures {
             .iter()
             .map(|assertion| {
                 let fixture = self.get(&assertion.reference)?;
+                if fixture.contains_non_integer_numbers {
+                    return Err("fixture_assertion_number_requires_integer".into());
+                }
                 if assertion.compare_as_set {
                     if fixture.kind != FixtureKind::Array {
                         return Err("fixture_assertion_set_requires_array".into());
@@ -274,6 +289,16 @@ impl BoundFixtures {
                 })
             })
             .collect()
+    }
+}
+
+// The bounded JSON parser may round decimals and out-of-range integers to f64.
+fn contains_non_integer_number(value: &Value) -> bool {
+    match value {
+        Value::Number(number) => !number.is_i64() && !number.is_u64(),
+        Value::Array(items) => items.iter().any(contains_non_integer_number),
+        Value::Object(fields) => fields.values().any(contains_non_integer_number),
+        _ => false,
     }
 }
 
@@ -403,6 +428,13 @@ mod tests {
             ("integer", "18446744073709551615", "18446744073709551615"),
             ("integer", "-22", "-22"),
             ("number", "0.25", "0.25"),
+            (
+                "number",
+                " \n0.2500000000000000000000000001\r\t",
+                "0.2500000000000000000000000001",
+            ),
+            ("number", "18446744073709551617", "18446744073709551617"),
+            ("number", "1E+02", "1E+02"),
             ("boolean", "false", "false"),
         ] {
             let fixtures = load_fixture(kind, input).unwrap();
@@ -472,6 +504,70 @@ mod tests {
         assert!(prepared[0].matches(&json!({"a/b~": [null]})));
         assert!(!prepared[0].matches(&json!({"a/b~": []})));
         assert!(!prepared[0].matches(&json!({"a/b~": ["null"]})));
+    }
+
+    #[test]
+    fn assertions_refuse_expected_numbers_without_an_exact_integer_representation() {
+        let equals = assertion(json!({"pointer": "", "equals": {"fixture": "value"}}));
+        let equals_set = assertion(json!({"pointer": "", "equals_set": {"fixture": "value"}}));
+        for (kind, input) in [
+            ("number", "0.25"),
+            ("number", "1e0"),
+            ("number", "-9223372036854775809"),
+            ("object", r#"{"items":[true,{"id":1.0}]}"#),
+            ("array", "[18446744073709551616]"),
+            ("array", "[18446744073709551617]"),
+        ] {
+            let fixture = load_fixture(kind, input).unwrap();
+            for config in [
+                std::slice::from_ref(&equals),
+                std::slice::from_ref(&equals_set),
+            ] {
+                if kind != "array" && config[0].compare_as_set {
+                    continue;
+                }
+                assert_eq!(
+                    fixture.assertions(config).err().unwrap(),
+                    "fixture_assertion_number_requires_integer",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tenant_sets_match_full_width_integers_without_accepting_rounded_responses() {
+        let config = assertion(json!({"pointer": "/ids", "equals_set": {"fixture": "value"}}));
+        let fixture = load_fixture("array", r#"[18446744073709551615,"tenant-a",null]"#).unwrap();
+        let prepared = fixture.assertions(&[config]).unwrap();
+        let received = |input: &str| parse_json_with_limit(input.as_bytes(), 1024).unwrap();
+        assert!(prepared[0].matches(&received(
+            r#"{"ids":["tenant-a",null,18446744073709551615]}"#
+        )));
+        for actual in [
+            r#"{"ids":["tenant-a",null,18446744073709551614]}"#,
+            r#"{"ids":["tenant-a",null,18446744073709551616]}"#,
+            r#"{"ids":["tenant-a",null,18446744073709551617]}"#,
+            r#"{"ids":["tenant-a",null,18446744073709551615.0]}"#,
+        ] {
+            assert!(!prepared[0].matches(&received(actual)));
+        }
+    }
+
+    #[test]
+    fn nested_assertions_preserve_exact_integers_and_string_identity() {
+        let config = assertion(json!({"pointer": "", "equals": {"fixture": "value"}}));
+        let expected = r#"{"account":[{"id":"18446744073709551616","active":true},null,-9223372036854775808]}"#;
+        let fixture = load_fixture("object", expected).unwrap();
+        let prepared = fixture.assertions(&[config]).unwrap();
+        let received = |input: &str| parse_json_with_limit(input.as_bytes(), 1024).unwrap();
+        assert!(prepared[0].matches(&received(expected)));
+        for actual in [
+            r#"{"account":[{"id":"18446744073709551617","active":true},null,-9223372036854775808]}"#,
+            r#"{"account":[{"id":"18446744073709551616","active":true},null,-9223372036854775809]}"#,
+            r#"{"account":[{"id":"18446744073709551616","active":true},null,-9223372036854775808.0]}"#,
+        ] {
+            assert!(!prepared[0].matches(&received(actual)));
+        }
     }
 
     #[test]

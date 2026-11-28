@@ -1030,6 +1030,16 @@ fn assert_fixture_redacted(output: &Output, saved: &str) {
     }
 }
 
+fn assert_fixture_preflight_failure(output: &Output, reason: &str) {
+    assert_fixture_redacted(output, "");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        output.stderr,
+        format!("Workload preflight failed: {reason}\n").as_bytes()
+    );
+}
+
 #[test]
 fn actor_fixtures_check_tenant_sets_and_typed_fields_for_each_measured_read() {
     let [alice, bob] = &FIXTURE_ACTORS;
@@ -1138,10 +1148,21 @@ fn invalid_measured_actor_fixtures_block_even_valid_setup() {
     let server = Server::new();
     let p = actor_fixture_plan();
     let tenant_binding = FIXTURE_ACTORS[1].env("TENANTS");
-    for value in [
-        None,
-        Some(r#""invalid-tenant-fixture-private""#),
-        Some(r#"["invalid-tenant-fixture-private",]"#),
+    for (value, reason) in [
+        (None, "fixture_environment_missing_or_invalid"),
+        (
+            Some(r#""invalid-tenant-fixture-private""#),
+            "fixture_value_type_mismatch",
+        ),
+        (
+            Some(r#"["invalid-tenant-fixture-private",]"#),
+            "fixture_json_invalid",
+        ),
+        (
+            // One more than u64::MAX, which the parser stores as a float.
+            Some(r#"["invalid-tenant-fixture-private",18446744073709551616]"#),
+            "fixture_assertion_number_requires_integer",
+        ),
     ] {
         let mut run = command(&temp, &p, Some(&server));
         for actor in &FIXTURE_ACTORS {
@@ -1153,9 +1174,8 @@ fn invalid_measured_actor_fixtures_block_even_valid_setup() {
             run.env_remove(&tenant_binding);
         }
         let output = run.args(["--output", "invalid.json"]).output().unwrap();
-        assert!(!output.status.success());
+        assert_fixture_preflight_failure(&output, reason);
         assert!(!temp.0.join("invalid.json").exists());
-        assert_fixture_redacted(&output, "");
         assert!(server.seen().is_empty());
     }
 }
@@ -1172,10 +1192,13 @@ fn actor_fixture_preview_rejects_unknown_references_and_invalid_pointers() {
     wrong_type["actors"]["b"]["fixtures"]["filter"]["type"] = json!("array");
     let mut invalid_pointer = actor_fixture_plan();
     invalid_pointer["requests"]["read"]["expect_fields"][1]["pointer"] = json!("/bad~2escape");
-    for invalid in [unknown, wrong_type, invalid_pointer] {
+    for (invalid, reason) in [
+        (unknown, "fixture_reference_unknown"),
+        (wrong_type, "fixture_request_scalar_required"),
+        (invalid_pointer, "invalid_workload_structure"),
+    ] {
         let output = command(&temp, &invalid, None).output().unwrap();
-        assert!(!output.status.success());
-        assert_fixture_redacted(&output, "");
+        assert_fixture_preflight_failure(&output, reason);
     }
 }
 
