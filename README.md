@@ -1,9 +1,40 @@
 # rusta-pitest
 
-A small Rust CLI for checking HTTP APIs and measuring response times. Send GET
-and POST requests to your own HTTP/HTTPS service, run concurrent workloads, and
-save versioned JSON reports. Optional Roots and SleepAPI presets are included;
-neither service is required to use the runner.
+A Rust CLI for checking HTTP APIs and measuring response times. Send GET and POST
+requests to your own service, run concurrent workloads, and save versioned JSON
+reports. Roots and SleepAPI presets are optional.
+
+## Preview a workload
+
+With Rust installed, run this from the repository root to see what the
+[example workload](examples/workload.json) would send.
+
+```sh
+cargo run --locked -- workload run examples/workload.json
+```
+
+From an extracted [release archive](#install-the-alpha), use
+`./rusta-pitest workload run examples/workload.json`.
+
+The JSON preview includes these fields.
+
+```json
+{
+  "executed": false,
+  "mode": "preview",
+  "passed": null,
+  "planned_requests": 32,
+  "setup_steps": 1
+}
+```
+
+The plan has one setup step followed by 32 requests across two measured phases.
+The preview sends no HTTP requests and reads no credentials. The `null` value
+for `passed` means the runner has not tested the API yet.
+
+- [Check your own API](#check-your-own-api) with a single GET and an expected status.
+- [Contribute to the runner](CONTRIBUTING.md#get-started). Set up the project,
+  run the tests, and open a pull request.
 
 ## Install the alpha
 
@@ -52,7 +83,20 @@ Release checks include `cargo-audit` 0.22.2 with `cargo audit --deny warnings`;
 known vulnerabilities and denied warnings block publication. Final validation
 and artifact evidence are recorded in the published GitHub release.
 
-## Try it locally
+## Check your own API
+
+After [installing the CLI](#install-the-alpha), substitute a GET endpoint on your
+service and the HTTP status you expect.
+
+```sh
+API_URL='http://127.0.0.1:8000/health'
+rusta-pitest get "$API_URL" --expect-status 200
+```
+
+The CLI exits with code `0` when the response matches. To try a check with a
+temporary server, follow the local example below.
+
+### Try it locally
 
 Start a temporary HTTP server in an empty directory, bound to loopback only:
 
@@ -103,16 +147,10 @@ include this capability.
 
 ## Authored workloads
 
-Introduced in `v0.1.0-alpha.4`, `workload run` previews an authored plan without
-traffic or reading secret environment values:
-
-```sh
-cargo run --locked -- workload run examples/workload.json
-```
-
-The runner adds isolated actor cookie/custom-header bindings, fixed-arrival
-request mixes, measured phases, reserved group capacity, explicit request
-sequences and opted-in writes/replay. It records offered, started, completed,
+Introduced in `v0.1.0-alpha.4`, `workload run` supports isolated actor
+cookie/custom-header bindings, fixed-arrival request mixes, measured phases,
+reserved group capacity, explicit request sequences and opted-in writes/replay.
+It records offered, started, completed,
 failed, cancelled and unsent requests, scoped thresholds, per-route latency,
 and bounded timing evidence. There is no request queue, automatic retry, or
 automatic authentication renewal. Execution requires `--execute`, an explicit
