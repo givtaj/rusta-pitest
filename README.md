@@ -38,21 +38,21 @@ for `passed` means the runner has not tested the API yet.
 
 ## Install the alpha
 
-`v0.1.0-alpha.8` adds a bounded capacity sweep for one GET or HEAD operation.
-It tests sustained request rates and synchronized bursts separately, then
-repeats each last passing level twice to check the result. CLI
-options and the JSON report schema may change in later alpha versions. The
-supported binaries are Linux x86_64 (Ubuntu 24.04 or a compatible glibc
-environment) and macOS arm64.
-Other operating systems and architectures are not verified for this release.
+`v0.1.0-alpha.9` adds private typed fixtures for authored workloads. Each
+actor can bind values for path segments, query values, and expected JSON
+fields. A read can return HTTP 200 and pass its response schema while failing
+the actor's expected tenant-set check. CLI options and JSON report schemas may
+change in later alpha versions. The supported binaries are Linux x86_64
+(Ubuntu 24.04 or a compatible glibc environment) and macOS arm64. Release
+verification covers those two targets.
 
 Download the archive for your platform and `SHA256SUMS` from the
-[GitHub release](https://github.com/givtaj/rusta-pitest/releases/tag/v0.1.0-alpha.8).
+[GitHub release](https://github.com/givtaj/rusta-pitest/releases/tag/v0.1.0-alpha.9).
 Verify the downloaded archive before extracting it:
 
 ```sh
 # macOS; on Linux, use sha256sum instead of shasum -a 256.
-shasum -a 256 rusta-pitest-v0.1.0-alpha.8-*.tar.gz
+shasum -a 256 rusta-pitest-v0.1.0-alpha.9-*.tar.gz
 ```
 
 Compare the complete digest and filename with the matching line in
@@ -66,7 +66,7 @@ toolchain:
 
 ```sh
 cargo install --locked --git https://github.com/givtaj/rusta-pitest.git \
-  --tag v0.1.0-alpha.8 rusta-pitest
+  --tag v0.1.0-alpha.9 rusta-pitest
 rusta-pitest --version
 ```
 
@@ -74,7 +74,7 @@ This alpha is distributed through GitHub; no crates.io publication is required.
 The repository development examples below use `cargo run --release -- ...`;
 after installation, use `rusta-pitest ...` with the same arguments.
 
-See the [release notes](docs/releases/v0.1.0-alpha.8.md),
+See the [release notes](docs/releases/v0.1.0-alpha.9.md),
 [release thresholds](docs/release-policy.md), and [changelog](CHANGELOG.md).
 The release thresholds govern release quality. Authored workloads additionally
 provide per-run latency and failure thresholds; direct benchmarks and generated
@@ -168,10 +168,9 @@ pagination. Earlier releases reject the query field. See
 [structured query parameters](docs/workloads.md#structured-query-parameters)
 and the [complete synthetic example](examples/workload-query.json).
 
-In source builds with [private actor fixtures](docs/workloads.md#private-actor-fixtures),
-each actor can bind typed values for path segments, query values, and expected
-response fields. This lets the same read check each actor’s expected tenant set
-even when both credentials return HTTP 200.
+From alpha.9, [private actor fixtures](docs/workloads.md#private-actor-fixtures)
+bind typed JSON from each actor's environment. The workload guide includes a
+loopback example that checks tenant membership with two synthetic credentials.
 
 From alpha.4, OpenAPI commands also accept bounded larger inputs:
 `openapi generate --max-input-bytes` defaults to 1 MiB, its
