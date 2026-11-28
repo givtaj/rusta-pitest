@@ -503,10 +503,9 @@ pub async fn run(options: CapacityOptions) -> Result<Value, String> {
     let placeholder = Url::parse("http://preview.invalid/").expect("static URL");
     let request = workload_http::prepare(
         options.base_url.as_ref().unwrap_or(&placeholder),
-        &plan.actor,
+        &plan.actor.bind(options.execute)?,
         &plan.request,
         Path::new("."),
-        options.execute,
         false,
     )?;
 

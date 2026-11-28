@@ -35,6 +35,12 @@ class Demo(BaseHTTPRequestHandler):
             )
             matched = self.path == expected
             return self.reply(200 if matched else 400, {"ok": matched})
+        if self.path == "/cases/demo-case?view=summary":
+            tenants = {"session=alice": [202, 101], "session=bob": [303]}
+            selected = tenants.get(self.headers.get("Cookie"))
+            if selected is None:
+                return self.reply(403, {"denied": True})
+            return self.reply(200, {"id": "demo-case", "tenants": selected})
         if self.path == "/denied":
             return self.reply(401, {"denied": True})
         cookie = self.headers.get("Cookie", "")
@@ -66,7 +72,7 @@ the caller or an external harness owns those tasks and readiness checks.
 
 In another terminal, from the repository, preview the
 [complete example](../examples/workload.json). Preview sends no HTTP requests,
-does not read secret environment values or body files, and has `passed: null`:
+does not read private environment values or body files, and has `passed: null`:
 
 ```sh
 cargo run --locked -- workload run examples/workload.json
@@ -104,7 +110,7 @@ or `.`. IDs remain visible in reports, so use non-sensitive names.
 
 | Field | Meaning |
 | --- | --- |
-| `actors` | Map of actor IDs to `{"headers_env":{"Header-Name":"ENV_NAME"}}`; `{}` is an anonymous actor |
+| `actors` | Map of actor IDs to optional `headers_env` and [private `fixtures`](#private-actor-fixtures); `{}` is an anonymous actor |
 | `requests` | Map of named request specifications, described below |
 | `groups` | Each group has distinct `actors`, `max_in_flight`, and exactly one of `requests` or `sequence` |
 | `phases` | Ordered `name`, positive `duration_ms`, and `rates` mapping group IDs to offered arrivals per second; omitted/zero rates offer no traffic |
@@ -115,21 +121,23 @@ or `.`. IDs remain visible in reports, so use non-sensitive names.
 | `thresholds` | Optional maximum-based checks with request/group/phase scope |
 | `evidence` | Optional `max_records` and `max_bytes`; defaults `10000` and `2097152` |
 
-A request requires `method` and a slash-prefixed `path`, such as `/widgets/one`.
+A request requires `method` and `path`. Use a slash-prefixed string such as
+`/widgets/one`, or use [structured path segments](#private-actor-fixtures).
 The explicit `--base-url` may include a path prefix; `/api/v1` plus `/widgets`
 sends `/api/v1/widgets`. Base credentials, queries and fragments are rejected.
 Absolute/authority paths, dot segments, encoded path separators, malformed
-percent escapes, queries, and fragments in request paths are rejected. Supply
-already percent-encoded path data where necessary; no response extraction or
-dynamic URL templating occurs.
+percent escapes, queries, and fragments in literal path strings are rejected.
+Supply percent-encoded path data in a literal string where necessary. Structured
+segments accept raw data and encode it once.
 
 Optional request fields are `expect_status`, `response_schema`, `body_env`,
-`body_file`, `content_type`, `idempotency_key_env`, and `query` (from alpha.6).
+`body_file`, `content_type`, `idempotency_key_env`, `query` (from alpha.6), and
+[`expect_fields`](#private-actor-fixtures).
 Without `expect_status`,
 any 2xx status passes; set an exact `401` or `403` for a denial case. An optional
 inline `response_schema` checks JSON using the supported schema subset and local
 references, without external retrieval. It does not assert media type or JSON
-`format`. HEAD is bodyless and cannot have a response schema.
+`format`. HEAD is bodyless and cannot have a response schema or field assertions.
 The same [schema admission limits](openapi-suites.md#assertions-and-coverage) apply
 to workload response schemas; unsupported or over-budget schemas reject the
 plan during preflight, before setup or measured traffic. HTTP timeouts cover
@@ -152,9 +160,8 @@ a failed setup prevents measured requests from starting.
 
 ## Structured query parameters
 
-From alpha.6, each request supports an optional ordered `query` array.
-Earlier releases reject this field. Supply literal strings
-as separate name/value pairs:
+From alpha.6, each request supports an optional ordered `query` array. Earlier
+releases reject this field. Use separate name/value pairs for literal strings:
 
 ```json
 "query": [
@@ -167,11 +174,11 @@ as separate name/value pairs:
 
 Repeated names and pair order are preserved. Omitted `query` and `query: []`
 send no query and no trailing `?`. Names must be nonempty strings of at most
-128 UTF-8 bytes; values are strings of at most 4096 UTF-8 bytes and may be empty.
+128 UTF-8 bytes; resolved values may be empty and are limited to 4096 UTF-8 bytes.
 There may be at most 32 pairs and at most 8192 serialized query bytes, including
 `=` and `&` separators but excluding `?`. A pair accepts exactly `name` and
-`value`; unknown fields, nulls, numbers, nested arrays, and other non-string
-names/values are rejected. These checks run before setup or measured traffic.
+`value`. The value is a literal string or a [fixture reference](#private-actor-fixtures).
+These checks run before setup or measured traffic.
 
 Names and values are encoded individually. ASCII letters, digits, `-`, `.`, `_`,
 and `~` remain literal; every other UTF-8 byte becomes uppercase `%HH`. A space
@@ -182,9 +189,8 @@ The example above produces
 Do not pre-encode query values or append raw queries to `path` or `--base-url`;
 both still reject raw query strings and fragments.
 
-Query values are static literals in the private plan. There is no environment
-binding, variable interpolation, response extraction, automatic pagination, or
-cursor walking. A literal `${TOKEN}` is sent as literal data, not resolved.
+Only an explicit `{"fixture":"binding"}` resolves a private value. A string like
+`${TOKEN}` is sent as written. Each pair is fixed before the first request.
 Review plan files before sharing or committing them. Queries are unsuitable for
 credentials: a target, proxy, or access log may record the complete URL. The
 runner omits query names and values from preview, execution reports, evidence,
@@ -210,6 +216,93 @@ each execution.
 `workload_version` remains 1 and report `schema_version` remains 2. Existing plans
 that omit `query` keep their behavior. Older binaries reject plans containing
 the new field, including an empty array, rather than silently dropping it.
+
+## Private actor fixtures
+
+Source builds with fixture support accept `actors.<actor>.fixtures` to bind
+values independently for each actor. Each binding declares `env` and
+`type`. Supported types are `string`, `integer`, `number`, `boolean`, `array`,
+`object`, and `null`. Supply each environment value as JSON. A string requires
+JSON quotation marks, while a header binding still takes the complete raw
+header value. Preview validates declarations and references without reading
+private values. Execution resolves them once per selected actor during preflight
+and rejects missing, invalid, or incorrectly typed values before setup or
+measured traffic.
+An actor can declare up to 32 fixtures. Each JSON environment value is limited
+to 8 KiB, with a combined limit of 64 KiB per actor.
+
+The object `{"fixture":"binding"}` refers to a binding on the actor selected for
+that request. Use references in structured path segments, query values, and
+`expect_fields`. Path segments and query values accept string, integer, number,
+and boolean fixtures. JSON numbers used in URLs retain their original numeric
+spelling. The runner encodes each segment or query value once. Each structured
+path segment must be nonempty and cannot contain a slash, backslash, or ASCII
+control character. The segments `.` and `..` are also rejected. Literal path strings and literal query values keep their
+existing behavior. Binaries built before fixture support reject the new syntax.
+
+Each field assertion uses a JSON Pointer. `equals` compares the JSON value at
+that pointer to the fixture value. `equals_set` compares arrays as unordered
+sets of up to 256 scalars, with duplicates rejected in either array.
+Numeric values in expected fields, including nested values and set members,
+must be integer tokens from `-9223372036854775808` through
+`18446744073709551615`. Preflight rejects out-of-range integers, fractions,
+and exponential notation in expectations to prevent rounded values from
+matching. For larger or decimal identifiers, compare JSON strings on both
+sides. Each request allows up to 32 assertions, with pointers limited to
+1,024 bytes and 32 segments. Field assertions apply alongside an optional `response_schema`.
+A missing or mismatched field fails with `response_field_mismatch`. Fixture
+values and environment-variable names stay out of runner reports and diagnostics.
+Paths and queries still go to the target and may appear in its access logs.
+
+Save this synthetic plan as `actor-fixtures.json` and start the loopback fixture
+from [the first section](#try-a-synthetic-local-workload).
+
+```json
+{
+  "workload_version": 1,
+  "actors": {
+    "reader": {
+      "headers_env": {"Cookie": "RUSTA_DEMO_CASE_COOKIE"},
+      "fixtures": {
+        "case_id": {"env": "RUSTA_DEMO_CASE_ID", "type": "string"},
+        "view": {"env": "RUSTA_DEMO_CASE_VIEW", "type": "string"},
+        "expected_tenants": {"env": "RUSTA_DEMO_CASE_TENANTS", "type": "array"}
+      }
+    }
+  },
+  "requests": {
+    "read": {
+      "method": "GET",
+      "path": {"segments": ["cases", {"fixture": "case_id"}]},
+      "query": [{"name": "view", "value": {"fixture": "view"}}],
+      "response_schema": {
+        "type": "object", "required": ["id", "tenants"],
+        "properties": {"id": {"type": "string"}, "tenants": {"type": "array"}}
+      },
+      "expect_fields": [
+        {"pointer": "/tenants", "equals_set": {"fixture": "expected_tenants"}},
+        {"pointer": "/id", "equals": {"fixture": "case_id"}}
+      ]
+    }
+  },
+  "groups": {"reads": {"actors": ["reader"], "requests": ["read"], "max_in_flight": 1}},
+  "phases": [{"name": "check", "duration_ms": 1000, "rates": {"reads": 1}}]
+}
+```
+
+```sh
+cargo run --locked -- workload run actor-fixtures.json
+export RUSTA_DEMO_CASE_ID='"demo-case"' RUSTA_DEMO_CASE_VIEW='"summary"'
+export RUSTA_DEMO_CASE_TENANTS='[101,202]' RUSTA_DEMO_CASE_COOKIE='session=alice'
+cargo run --locked -- workload run actor-fixtures.json \
+  --execute --base-url http://127.0.0.1:8001 --operation read
+```
+
+The first execution passes even though the response lists the tenants in the
+opposite order. Set `RUSTA_DEMO_CASE_COOKIE='session=bob'` and rerun the execution
+with the expected tenant fixture unchanged. The alternate synthetic identity
+returns HTTP 200 and passes the same response schema. Its tenant set fails the
+field assertion because the expected set is bound independently of the credential.
 
 ## Sequences and deliberate writes
 

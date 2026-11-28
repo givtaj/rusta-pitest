@@ -2,7 +2,11 @@
 //!
 //! Secret material is loaded only during execution preparation. It has no
 //! Debug/Serialize implementation and never appears in an outcome or error.
+mod fixtures;
+
+use fixtures::{BoundFixtures, FieldAssertion, FixtureDecl, FixtureRef, PreparedAssertion};
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     fs::File,
     io::Read,
@@ -29,46 +33,98 @@ const MAX_QUERY_NAME_BYTES: usize = 128;
 const MAX_QUERY_VALUE_BYTES: usize = 4096;
 const MAX_QUERY_BYTES: usize = 8192;
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Actor {
     #[serde(default)]
-    pub headers_env: BTreeMap<String, String>,
+    headers_env: BTreeMap<String, String>,
+    #[serde(default)]
+    fixtures: BTreeMap<String, FixtureDecl>,
+}
+
+pub struct BoundActor<'a> {
+    headers_env: &'a BTreeMap<String, String>,
+    fixtures: BoundFixtures,
+    execute: bool,
+}
+
+impl Actor {
+    pub fn bind(&self, execute: bool) -> Result<BoundActor<'_>, String> {
+        Ok(BoundActor {
+            headers_env: &self.headers_env,
+            fixtures: BoundFixtures::load(&self.fixtures, execute)?,
+            execute,
+        })
+    }
 }
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestSpec {
     pub method: String,
-    pub path: String,
+    path: RequestPath,
     #[serde(default)]
-    pub query: Vec<QueryPair>,
+    query: Vec<QueryPair>,
     pub body_env: Option<String>,
     pub body_file: Option<String>,
     pub content_type: Option<String>,
     pub idempotency_key_env: Option<String>,
     pub expect_status: Option<u16>,
     pub response_schema: Option<Value>,
+    #[serde(default)]
+    expect_fields: Vec<FieldAssertion>,
 }
 
 #[derive(Clone, Deserialize)]
-#[serde(try_from = "BTreeMap<String, String>")]
-pub struct QueryPair {
-    pub name: String,
-    pub value: String,
+#[serde(untagged, deny_unknown_fields)]
+enum RequestPath {
+    Literal(String),
+    Segments { segments: Vec<UrlPart> },
 }
 
-impl TryFrom<BTreeMap<String, String>> for QueryPair {
+#[derive(Clone, Deserialize)]
+#[serde(untagged)]
+enum UrlPart {
+    Literal(String),
+    Fixture(FixtureRef),
+}
+
+impl UrlPart {
+    fn resolve<'a>(
+        &'a self,
+        fixtures: &'a BoundFixtures,
+        preview: &'static str,
+    ) -> Result<Cow<'a, str>, String> {
+        match self {
+            Self::Literal(text) => Ok(Cow::Borrowed(text)),
+            Self::Fixture(reference) => Ok(fixtures
+                .scalar(reference)?
+                .unwrap_or(Cow::Borrowed(preview))),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(try_from = "BTreeMap<String, UrlPart>")]
+struct QueryPair {
+    name: String,
+    value: UrlPart,
+}
+
+impl TryFrom<BTreeMap<String, UrlPart>> for QueryPair {
     type Error = &'static str;
 
-    fn try_from(mut fields: BTreeMap<String, String>) -> Result<Self, Self::Error> {
+    fn try_from(mut fields: BTreeMap<String, UrlPart>) -> Result<Self, Self::Error> {
         // A derived struct deserializer also accepts positional arrays. A map
-        // enforces object-only pairs, and its value type requires strings.
+        // enforces object-only pairs.
         if fields.len() != 2 {
             return Err("query_pair_fields_invalid");
         }
+        let Some(UrlPart::Literal(name)) = fields.remove("name") else {
+            return Err("query_pair_fields_invalid");
+        };
         Ok(Self {
-            name: fields.remove("name").ok_or("query_pair_fields_invalid")?,
+            name,
             value: fields.remove("value").ok_or("query_pair_fields_invalid")?,
         })
     }
@@ -78,6 +134,7 @@ pub struct PreparedRequest {
     request: Request,
     expect_status: Option<u16>,
     response_schema: Option<Validator>,
+    assertions: Vec<PreparedAssertion>,
     executable: bool,
 }
 
@@ -104,12 +161,12 @@ pub fn client(timeout_ms: u64) -> Result<Client, String> {
 
 pub fn prepare(
     base: &Url,
-    actor: &Actor,
+    actor: &BoundActor<'_>,
     spec: &RequestSpec,
     root: &Path,
-    execute: bool,
     allow_writes: bool,
 ) -> Result<PreparedRequest, String> {
+    let execute = actor.execute;
     let method = match spec.method.as_str() {
         "GET" => Method::GET,
         "HEAD" => Method::HEAD,
@@ -121,10 +178,10 @@ pub fn prepare(
         }
         _ => return Err("method_unsupported".into()),
     };
-    let mut url = target_url(base, &spec.path)?;
+    let mut url = target_url(base, &spec.path.resolve(&actor.fixtures)?)?;
     // Keep the caller-selected origin/path fixed before attaching raw query
     // data. Validate and freeze it before loading credentials or body files.
-    if let Some(query) = encode_query(&spec.query)? {
+    if let Some(query) = encode_query(&spec.query, &actor.fixtures)? {
         url.set_query(Some(&query));
     }
     if spec.body_env.is_some() && spec.body_file.is_some() {
@@ -150,12 +207,16 @@ pub fn prepare(
     if method == Method::HEAD && response_schema.is_some() {
         return Err("head_response_schema_unsupported".into());
     }
+    let assertions = actor.fixtures.assertions(&spec.expect_fields)?;
+    if method == Method::HEAD && !assertions.is_empty() {
+        return Err("head_response_fields_unsupported".into());
+    }
     let mut headers = HeaderMap::new();
     if actor.headers_env.len() > MAX_HEADERS {
         return Err("too_many_actor_headers".into());
     }
     let mut header_bytes = 0;
-    for (name, variable) in &actor.headers_env {
+    for (name, variable) in actor.headers_env {
         let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| "header_name_invalid")?;
         if reserved_header(&name) {
             return Err("header_reserved".into());
@@ -216,6 +277,7 @@ pub fn prepare(
         request,
         expect_status: spec.expect_status,
         response_schema,
+        assertions,
         executable: execute,
     })
 }
@@ -308,55 +370,80 @@ fn target_url(base: &Url, path: &str) -> Result<Url, String> {
     Ok(url)
 }
 
-fn query_unreserved(byte: u8) -> bool {
+impl RequestPath {
+    fn resolve<'a>(&'a self, fixtures: &BoundFixtures) -> Result<Cow<'a, str>, String> {
+        let segments = match self {
+            Self::Literal(path) => return Ok(Cow::Borrowed(path)),
+            Self::Segments { segments } => segments,
+        };
+        if segments.is_empty() {
+            return Err("request_path_invalid".into());
+        }
+        let mut path = String::new();
+        for segment in segments {
+            let value = segment.resolve(fixtures, "x")?;
+            if value.is_empty() {
+                return Err("request_path_invalid".into());
+            }
+            path.push('/');
+            append_encoded(&mut path, &value, MAX_PATH_BYTES, "request_path_invalid")?;
+        }
+        // target_url applies the existing decoded separator, control and dot-segment rules.
+        Ok(Cow::Owned(path))
+    }
+}
+
+fn unreserved(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
 }
 
-fn encode_query(pairs: &[QueryPair]) -> Result<Option<String>, String> {
+// Path segments and query components both use raw UTF-8 data and RFC 3986 unreserved bytes.
+fn append_encoded(
+    out: &mut String,
+    raw: &str,
+    limit: usize,
+    error: &'static str,
+) -> Result<(), String> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let size: usize = raw.bytes().map(|b| if unreserved(b) { 1 } else { 3 }).sum();
+    if out.len() + size > limit {
+        return Err(error.into());
+    }
+    for byte in raw.bytes() {
+        if unreserved(byte) {
+            out.push(char::from(byte));
+        } else {
+            out.push('%');
+            out.push(char::from(HEX[usize::from(byte >> 4)]));
+            out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    Ok(())
+}
+
+fn encode_query(pairs: &[QueryPair], fixtures: &BoundFixtures) -> Result<Option<String>, String> {
     if pairs.is_empty() {
         return Ok(None);
     }
     if pairs.len() > MAX_QUERY_PAIRS {
         return Err("query_pair_limit".into());
     }
-    // Count the encoded bytes, including '=' and '&', before allocating or
-    // expanding the input. The bounded pair/field lengths prevent overflow.
-    let mut size = pairs.len() - 1;
-    for pair in pairs {
+    let mut encoded = String::new();
+    for (index, pair) in pairs.iter().enumerate() {
         if pair.name.is_empty() || pair.name.len() > MAX_QUERY_NAME_BYTES {
             return Err("query_name_empty_or_exceeds_limit".into());
         }
-        if pair.value.len() > MAX_QUERY_VALUE_BYTES {
+        let value = pair.value.resolve(fixtures, "")?;
+        if value.len() > MAX_QUERY_VALUE_BYTES {
             return Err("query_value_exceeds_limit".into());
         }
-        size += 1;
-        for byte in pair.name.bytes().chain(pair.value.bytes()) {
-            size += if query_unreserved(byte) { 1 } else { 3 };
-        }
-        if size > MAX_QUERY_BYTES {
-            return Err("query_encoded_bytes_exceed_limit".into());
-        }
-    }
-    let mut encoded = String::with_capacity(size);
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    for (index, pair) in pairs.iter().enumerate() {
         if index > 0 {
             encoded.push('&');
         }
-        for (part, value) in [&pair.name, &pair.value].into_iter().enumerate() {
-            if part > 0 {
-                encoded.push('=');
-            }
-            for byte in value.bytes() {
-                if query_unreserved(byte) {
-                    encoded.push(char::from(byte));
-                } else {
-                    encoded.push('%');
-                    encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-                    encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-                }
-            }
-        }
+        let limit = "query_encoded_bytes_exceed_limit";
+        append_encoded(&mut encoded, &pair.name, MAX_QUERY_BYTES, limit)?;
+        encoded.push('=');
+        append_encoded(&mut encoded, &value, MAX_QUERY_BYTES, limit)?;
     }
     Ok(Some(encoded))
 }
@@ -479,13 +566,14 @@ pub async fn execute(client: &Client, prepared: &PreparedRequest) -> Outcome {
     {
         return failed(Some(status), "response_exceeds_limit");
     }
+    let check_json = prepared.response_schema.is_some() || !prepared.assertions.is_empty();
     let mut body = Vec::new();
     let mut body_bytes = 0usize;
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) if body_bytes.saturating_add(chunk.len()) <= MAX_RESPONSE_BYTES => {
                 body_bytes += chunk.len();
-                if prepared.response_schema.is_some() {
+                if check_json {
                     body.extend_from_slice(&chunk);
                 }
             }
@@ -508,12 +596,26 @@ pub async fn execute(client: &Client, prepared: &PreparedRequest) -> Outcome {
         if prepared.response_schema.is_some() {
             return rejected(status, "response_schema_body_unavailable");
         }
-    } else if let Some(validator) = &prepared.response_schema {
+        if !prepared.assertions.is_empty() {
+            return rejected(status, "response_field_body_unavailable");
+        }
+    } else if check_json {
         let Ok(value) = crate::strict_json::parse_json_with_limit(&body, MAX_RESPONSE_BYTES) else {
             return rejected(status, "response_json_invalid");
         };
-        if !validator.is_valid(&value) {
+        if prepared
+            .response_schema
+            .as_ref()
+            .is_some_and(|schema| !schema.is_valid(&value))
+        {
             return rejected(status, "response_schema_mismatch");
+        }
+        if !prepared
+            .assertions
+            .iter()
+            .all(|assertion| assertion.matches(&value))
+        {
+            return rejected(status, "response_field_mismatch");
         }
     }
     Outcome {
@@ -556,10 +658,21 @@ mod tests {
         time::Instant,
     };
 
+    fn prepare(
+        base: &Url,
+        actor: &Actor,
+        spec: &RequestSpec,
+        root: &Path,
+        execute: bool,
+        writes: bool,
+    ) -> Result<PreparedRequest, String> {
+        super::prepare(base, &actor.bind(execute)?, spec, root, writes)
+    }
+
     fn spec(method: &str, path: &str) -> RequestSpec {
         RequestSpec {
             method: method.into(),
-            path: path.into(),
+            path: RequestPath::Literal(path.into()),
             query: Vec::new(),
             body_env: None,
             body_file: None,
@@ -567,13 +680,12 @@ mod tests {
             idempotency_key_env: None,
             expect_status: None,
             response_schema: None,
+            expect_fields: Vec::new(),
         }
     }
 
     fn actor() -> Actor {
-        Actor {
-            headers_env: BTreeMap::new(),
-        }
+        Actor::default()
     }
 
     fn base() -> Url {
@@ -587,7 +699,7 @@ mod tests {
     fn pair(name: &str, value: &str) -> QueryPair {
         QueryPair {
             name: name.into(),
-            value: value.into(),
+            value: UrlPart::Literal(value.into()),
         }
     }
 
@@ -613,12 +725,20 @@ mod tests {
         let decoded: Vec<_> = plan.request.url().query_pairs().collect();
         for ((name, value), original) in decoded.iter().zip(&request.query) {
             assert_eq!(name, &original.name);
-            assert_eq!(value, &original.value);
+            assert_eq!(
+                value,
+                &original
+                    .value
+                    .resolve(&BoundFixtures::default(), "")
+                    .unwrap()
+            );
         }
     }
 
     #[test]
     fn query_limits_include_utf8_expansion_and_separators() {
+        let fixtures = BoundFixtures::default();
+        let encode_query = |pairs: &[QueryPair]| super::encode_query(pairs, &fixtures);
         assert!(encode_query(&vec![pair("x", ""); MAX_QUERY_PAIRS]).is_ok());
         assert_eq!(
             encode_query(&vec![pair("x", ""); MAX_QUERY_PAIRS + 1]).unwrap_err(),
@@ -640,7 +760,7 @@ mod tests {
             MAX_QUERY_BYTES
         );
         let mut excessive = exact;
-        excessive[1].value.push('y');
+        excessive[1] = pair("y", &"y".repeat(4092));
         assert_eq!(
             encode_query(&excessive).unwrap_err(),
             "query_encoded_bytes_exceed_limit"
@@ -665,6 +785,7 @@ mod tests {
         request.query = vec![pair("", "private-query-value")];
         let actor = Actor {
             headers_env: BTreeMap::from([("Cookie".into(), "RUSTA_MISSING_QUERY_TEST".into())]),
+            ..Actor::default()
         };
         assert_eq!(
             prepare(&base(), &actor, &request, Path::new("."), true, false)
@@ -678,6 +799,53 @@ mod tests {
     fn prepared_requests_can_be_shared_without_mutable_actor_state() {
         fn send_sync<T: Send + Sync>() {}
         send_sync::<PreparedRequest>();
+    }
+
+    #[test]
+    fn structured_paths_require_nonempty_segments_and_preserve_path_boundaries() {
+        use serde_json::json;
+        for invalid in [
+            json!([["x"]]),
+            json!({"segments": ["x"], "extra": true}),
+            json!({"segments": []}),
+            json!({"segments": [""]}),
+            json!({"segments": ["ok", ""]}),
+            json!({"segments": ["."]}),
+            json!({"segments": [".."]}),
+            json!({"segments": ["a/b"]}),
+            json!({"segments": ["a\\b"]}),
+            json!({"segments": ["a\nb"]}),
+            json!({"segments": ["a".repeat(MAX_PATH_BYTES)]}),
+        ] {
+            let request =
+                serde_json::from_value::<RequestSpec>(json!({"method": "GET", "path": invalid}));
+            if let Ok(request) = request {
+                assert!(preview(&request).is_err());
+            }
+        }
+        let request: RequestSpec = serde_json::from_value(json!({
+            "method": "GET", "path": {"segments": ["items", "a b%2F?"]}
+        }))
+        .unwrap();
+        let prepared = preview(&request).unwrap();
+        assert_eq!(prepared.request.url().path(), "/api/v1/items/a%20b%252F%3F");
+    }
+
+    #[test]
+    fn preview_allows_a_private_component_to_fit_at_the_size_limit() {
+        use serde_json::json;
+        let actor: Actor = serde_json::from_value(json!({
+            "fixtures": {"v": {"env": "RUSTA_FIXTURE_BOUNDARY", "type": "string"}}
+        }))
+        .unwrap();
+        let request: RequestSpec = serde_json::from_value(json!({
+            "method":"GET",
+            "path":{"segments":["x".repeat(MAX_PATH_BYTES - 3), {"fixture":"v"}]},
+            "query":[{"name":"a","value":"x".repeat(4096)},{"name":"b","value":"x".repeat(4088)},
+                     {"name":"v","value":{"fixture":"v"}}]
+        }))
+        .unwrap();
+        assert!(prepare(&base(), &actor, &request, Path::new("."), false, false).is_ok());
     }
 
     #[test]
@@ -751,6 +919,7 @@ mod tests {
                 "Cookie".into(),
                 "RUSTA_NONEXISTENT_SECRET_SENTINEL".into(),
             )]),
+            ..Actor::default()
         };
         let mut request = spec("POST", "/items");
         request.body_file = Some("not-created/body.bin".into());
@@ -838,6 +1007,7 @@ mod tests {
         ] {
             let actor = Actor {
                 headers_env: BTreeMap::from([(header.into(), "TOKEN".into())]),
+                ..Actor::default()
             };
             assert_eq!(
                 prepare(
@@ -858,6 +1028,7 @@ mod tests {
                 ("Cookie".into(), "ONE".into()),
                 ("cookie".into(), "TWO".into()),
             ]),
+            ..Actor::default()
         };
         assert_eq!(
             prepare(
@@ -874,6 +1045,7 @@ mod tests {
         );
         let actor = Actor {
             headers_env: BTreeMap::from([("Content-Type".into(), "TYPE".into())]),
+            ..Actor::default()
         };
         let mut request = spec("GET", "/");
         request.content_type = Some("application/json".into());
@@ -885,6 +1057,7 @@ mod tests {
         );
         let actor = Actor {
             headers_env: BTreeMap::from([("Idempotency-Key".into(), "ONE".into())]),
+            ..Actor::default()
         };
         request.content_type = None;
         request.idempotency_key_env = Some("TWO".into());
@@ -911,6 +1084,7 @@ mod tests {
                 "Cookie".into(),
                 "RUSTA_NONEXISTENT_SECRET_SENTINEL".into(),
             )]),
+            ..Actor::default()
         };
         let error = prepare(
             &base(),
@@ -926,6 +1100,7 @@ mod tests {
         assert!(!error.contains(sentinel));
         let actor = Actor {
             headers_env: BTreeMap::from([("X-Bad\nName".into(), "TOKEN".into())]),
+            ..Actor::default()
         };
         assert!(
             prepare(
@@ -949,6 +1124,7 @@ mod tests {
             headers_env: (0..=MAX_HEADERS)
                 .map(|index| (format!("X-{index}"), "TOKEN".into()))
                 .collect(),
+            ..Actor::default()
         };
         assert_eq!(
             prepare(
@@ -1412,13 +1588,15 @@ mod tests {
         request.idempotency_key_env = Some("RUSTA_HTTP_KEY".into());
         let actor_a = Actor {
             headers_env: BTreeMap::from([("Cookie".into(), "RUSTA_HTTP_COOKIE_A".into())]),
+            ..Actor::default()
         };
         let actor_b = Actor {
             headers_env: BTreeMap::from([("Cookie".into(), "RUSTA_HTTP_COOKIE_B".into())]),
+            ..Actor::default()
         };
         let plan_a = prepare(&server.url, &actor_a, &request, &directory.0, true, true).unwrap();
         let plan_b = prepare(&server.url, &actor_b, &request, &directory.0, true, true).unwrap();
-        request.query[0].value = "modified after preflight".into();
+        request.query[0] = pair("cursor", "modified after preflight");
         std::fs::write(directory.0.join("body.bin"), b"modified after preflight").unwrap();
         let http = client(500).unwrap();
         assert!(execute(&http, &plan_a).await.passed);
