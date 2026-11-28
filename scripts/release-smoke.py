@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from urllib.parse import quote
 
 
 def main():
@@ -25,16 +26,17 @@ def main():
     binary = args.binary.resolve(strict=True)
     # This repository uses a literal package version; keep the standalone
     # smoke compatible with the Python 3.9 supplied by macOS developer tools.
-    manifest = (Path(__file__).resolve().parents[1] / "Cargo.toml").read_text()
-    package = manifest.split("[package]", 1)[1].split("\n[", 1)[0]
-    version = args.expected_version or re.search(
-        r'^version\s*=\s*"([^"\n]+)"\s*$', package, re.MULTILINE
-    ).group(1)
+    version = args.expected_version
+    if version is None:
+        manifest = (Path(__file__).resolve().parents[1] / "Cargo.toml").read_text()
+        package = manifest.split("[package]", 1)[1].split("\n[", 1)[0]
+        version = re.search(r'^version\s*=\s*"([^"\n]+)"\s*$', package, re.MULTILINE).group(1)
     requests = []
     api_headers = []
     suite_cookie_headers = []
     workload_headers = []
     workload_writes = []
+    tenant_reads = []
     lock = threading.Lock()
     api_token = "rusta-smoke-auth-secret"
     suite_cookies = {user: f"rusta-smoke-{user}-cookie%=+/" for user in ("alice", "bob")}
@@ -61,6 +63,22 @@ def main():
         "rusta-query-value%20%E9%9B%AA%2B%25%2F%3F%23%26%3D"
         "&rusta-query-empty-private=&rusta-query-literal-private=%252F"
     )
+    tenant_actors = ("reader_a", "reader_b")
+    tenant_fixtures = {
+        actor: {
+            "cookie": f"session=rusta-smoke-tenant-{actor}-cookie",
+            "case": f"rusta-smoke-tenant-{actor}-case é+%?#",
+            "view": f"rusta-smoke-tenant-{actor}-view 雪+/%?#&=",
+            "tenants": [f"rusta-smoke-tenant-{actor}-first", f"rusta-smoke-tenant-{actor}-second"],
+        }
+        for actor in tenant_actors
+    }
+    tenant_targets = {
+        actor: f"/tenant-cases/{quote(fixture['case'], safe='')}?view={quote(fixture['view'], safe='')}"
+        for actor, fixture in tenant_fixtures.items()
+    }
+    tenant_routes = {route: actor for actor, route in tenant_targets.items()}
+    tenant_identities = {fixture["cookie"]: actor for actor, fixture in tenant_fixtures.items()}
     widget_response = {"200": {
         "description": "Synthetic widget",
         "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Widget"}}},
@@ -118,6 +136,20 @@ def main():
                 matched = self.path == workload_query_wire
                 status = 200 if matched else 400
                 payload = json.dumps({"matched": matched, "private": self.path}).encode()
+            elif self.path.startswith("/tenant-cases/"):
+                cookie = self.headers.get("Cookie")
+                with lock:
+                    tenant_reads.append((self.command, self.path, cookie))
+                    over_budget = len(tenant_reads) > 8
+                requested = tenant_routes.get(self.path)
+                identity = tenant_identities.get(cookie)
+                if over_budget or requested is None or identity is None:
+                    status, payload = 400, b'{"error":"unexpected synthetic tenant read"}'
+                else:
+                    payload = json.dumps({
+                        "id": tenant_fixtures[requested]["case"],
+                        "tenants": tenant_fixtures[identity]["tenants"][::-1],
+                    }).encode()
             elif self.path.startswith("/suite-cookie/"):
                 cookie_headers = self.headers.get_all("Cookie", [])
                 with lock:
@@ -759,6 +791,115 @@ components:
                                    "rusta-query-extra-private", "é", "v" * 4097):
                         assert marker not in rejected.stdout + rejected.stderr
 
+            tenant_types = {"case": "string", "view": "string", "tenants": "array"}
+            tenant_bindings = {
+                actor: {key: f"RUSTA_SMOKE_TENANTS_{actor.upper()}_{key.upper()}"
+                        for key in ("cookie", *tenant_types)}
+                for actor in tenant_actors
+            }
+            tenant_environment = {
+                bindings[key]: json.dumps(tenant_fixtures[actor][key])
+                for actor, bindings in tenant_bindings.items()
+                for key in tenant_types
+            }
+            tenant_markers = {origin, "/tenant-cases/", "rusta-smoke-tenant-"}
+            tenant_markers.update(name for bindings in tenant_bindings.values() for name in bindings.values())
+            for fixture in tenant_fixtures.values():
+                tenant_markers.update((fixture["cookie"], fixture["case"], fixture["view"],
+                                       quote(fixture["case"], safe=""), quote(fixture["view"], safe=""),
+                                       *fixture["tenants"]))
+
+            tenant_plan = {
+                "workload_version": 1,
+                "actors": {
+                    actor: {
+                        "headers_env": {"Cookie": bindings["cookie"]},
+                        "fixtures": {key: {"env": bindings[key], "type": kind}
+                                     for key, kind in tenant_types.items()},
+                    }
+                    for actor, bindings in tenant_bindings.items()
+                },
+                "requests": {"read": {
+                    "method": "GET",
+                    "path": {"segments": ["tenant-cases", {"fixture": "case"}]},
+                    "query": [{"name": "view", "value": {"fixture": "view"}}],
+                    "expect_status": 200,
+                    "response_schema": {
+                        "type": "object", "required": ["id", "tenants"],
+                        "properties": {"id": {"type": "string"},
+                                       "tenants": {"type": "array", "items": {"type": "string"}}},
+                    },
+                    "expect_fields": [
+                        {"pointer": "/id", "equals": {"fixture": "case"}},
+                        {"pointer": "/tenants", "equals_set": {"fixture": "tenants"}},
+                    ],
+                }},
+                "groups": {actor: {"actors": [actor], "max_in_flight": 1, "requests": ["read"]}
+                           for actor in tenant_actors},
+                "phases": [{"name": "read", "duration_ms": 500,
+                            "rates": {actor: 1 for actor in tenant_actors}}],
+                "max_in_flight": 2, "max_start_lag_ms": 500,
+                "timeout_ms": 2000, "drain_timeout_ms": 2000,
+            }
+
+            def check_tenant_output(result, filename):
+                saved = (directory / filename).read_bytes()
+                assert saved == result.stdout.encode()
+                for marker in tenant_markers:
+                    assert marker not in result.stdout + result.stderr, "tenant fixture data leaked"
+
+            (directory / "tenant-preview.plan.json").write_text(json.dumps(tenant_plan))
+            before = len(requests)
+            preview_result = run(["workload", "run", "tenant-preview.plan.json", "--base-url", origin,
+                                  "--operation", "read", "--output", "tenant-preview.json"],
+                                 environment={name: None for bindings in tenant_bindings.values()
+                                              for name in bindings.values()})
+            check_tenant_output(preview_result, "tenant-preview.json")
+            preview = json.loads(preview_result.stdout)
+            check_identity(preview["runner"])
+            assert preview["schema_version"] == 2 and preview["kind"] == "workload"
+            assert preview["executed"] is False and preview["runtime_secrets_loaded"] is False
+            assert preview["passed"] is None and preview["planned_requests"] == 2
+            assert len(requests) == before, "tenant preview must send no traffic"
+
+            reader_a, reader_b = tenant_actors
+            for name, identities, check_fields, passing in (
+                ("matching", (reader_a, reader_b), True, {reader_a, reader_b}),
+                ("reused", (reader_b, reader_b), True, {reader_b}),
+                ("swapped", (reader_b, reader_a), True, set()),
+                ("schema-only", (reader_b, reader_a), False, {reader_a, reader_b}),
+            ):
+                # Keep each actor's fixture values fixed and change only the
+                # credentials for the wrong-identity controls.
+                environment = dict(tenant_environment)
+                for actor, identity in zip(tenant_actors, identities):
+                    environment[tenant_bindings[actor]["cookie"]] = tenant_fixtures[identity]["cookie"]
+                if not check_fields:
+                    del tenant_plan["requests"]["read"]["expect_fields"]
+                before, before_tenant = len(requests), len(tenant_reads)
+                case_name = f"tenant-{name}"
+                result, document = workload_case(case_name, tenant_plan,
+                    expected=int(len(passing) != 2), environment=environment)
+                check_tenant_output(result, f"{case_name}.report.json")
+                seen = tenant_reads[before_tenant:]
+                assert len(requests) == before + 2 and len(seen) == 2
+                assert set(seen) == {
+                    ("GET", tenant_targets[actor], tenant_fixtures[identity]["cookie"])
+                    for actor, identity in zip(tenant_actors, identities)
+                }, "each actor must send its own path and query with the selected credential"
+                counts = document["counts"]
+                assert counts["offered"] == counts["complete_http_responses"] == 2
+                assert counts["passed"] == len(passing) and counts["failed"] == 2 - len(passing)
+                evidence = document["evidence"]
+                assert evidence["complete"] and evidence["captured_records"] == 2
+                records = evidence["records"]
+                assert len(records) == 2 and {row["actor"] for row in records} == set(tenant_actors)
+                for row in records:
+                    assert row["operation"] == "read" and row["status"] == 200
+                    passed = row["actor"] in passing
+                    assert row["outcome"] == ("passed" if passed else "failed")
+                    assert row["reason"] == ("passed" if passed else "response_field_mismatch")
+
             write_key = "rusta-smoke-immutable-idempotency-secret"
             write_body = b"immutable\x00rusta-smoke-body-secret\xff\n"
             write_plan = {
@@ -820,7 +961,7 @@ components:
         server.shutdown()
         server.server_close()
         worker.join(timeout=2)
-    print(f"Release smoke passed: {version}; GET, POST, duration, statuses, timeout, JSON accounting, OpenAPI JSON/YAML/URL generation and byte limits, decoded alias budgets, expanded schema preflight, previews, authenticated GET/HEAD, cookie bindings/isolation/denial, reserved path data, partial-EOF cancellation, schema failure, workload actors/phases/denial/accounting, structured query encoding/preflight/redaction, write opt-in/replay, thresholds/capture loss, redaction and output preservation")
+    print(f"Release smoke passed: {version}; GET, POST, duration, statuses, timeout, JSON accounting, OpenAPI JSON/YAML/URL generation and byte limits, decoded alias budgets, expanded schema preflight, previews, authenticated GET/HEAD, cookie bindings/isolation/denial, reserved path data, partial-EOF cancellation, schema failure, workload actors/phases/denial/accounting, structured query encoding/preflight/redaction, private per-actor tenant fixtures, write opt-in/replay, thresholds/capture loss, redaction and output preservation")
 
 
 if __name__ == "__main__":

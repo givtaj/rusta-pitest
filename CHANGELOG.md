@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.0-alpha.9 — 2026-11-28
+
+- Bind private typed JSON values per actor during workload preflight. Use them
+  in structured path segments, query values, and expected response fields.
+  Preview checks declarations and references without loading private values.
+- Compare expected JSON values and unordered scalar sets with `expect_fields`.
+  A measured read with HTTP 200 and a valid response schema still fails with
+  `response_field_mismatch` when the actor's expected tenant set differs.
+- Preserve validated numeric spelling in URL fixtures and require exactly
+  represented integers in numeric response expectations. Use JSON strings for
+  identifiers that are fractional or outside the supported integer range.
+- Exercise per-actor bindings, a credential swap, the schema-only control, and
+  redaction in the release-binary smoke suite.
+
+See the [alpha.9 release notes](docs/releases/v0.1.0-alpha.9.md) for compatibility
+and the [workload guide](docs/workloads.md#private-actor-fixtures) for a loopback
+example.
+
 ## 0.1.0-alpha.8 — 2026-11-25
 
 - Add `workload capacity` to find a repeatedly passing request rate and burst

@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing version tag to build (for example v0.1.0-alpha.8)
+        description: Existing version tag to build (for example v0.1.0-alpha.9)
         required: true
         type: string
 

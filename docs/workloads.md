@@ -177,8 +177,9 @@ send no query and no trailing `?`. Names must be nonempty strings of at most
 128 UTF-8 bytes; resolved values may be empty and are limited to 4096 UTF-8 bytes.
 There may be at most 32 pairs and at most 8192 serialized query bytes, including
 `=` and `&` separators but excluding `?`. A pair accepts exactly `name` and
-`value`. The value is a literal string or a [fixture reference](#private-actor-fixtures).
-These checks run before setup or measured traffic.
+`value`. The value is a literal string or, from alpha.9, a
+[fixture reference](#private-actor-fixtures). These checks run before setup or
+measured traffic.
 
 Names and values are encoded individually. ASCII letters, digits, `-`, `.`, `_`,
 and `~` remain literal; every other UTF-8 byte becomes uppercase `%HH`. A space
@@ -219,8 +220,8 @@ the new field, including an empty array, rather than silently dropping it.
 
 ## Private actor fixtures
 
-Source builds with fixture support accept `actors.<actor>.fixtures` to bind
-values independently for each actor. Each binding declares `env` and
+From alpha.9, `workload run` accepts `actors.<actor>.fixtures` to bind values
+independently for each actor. Each binding declares `env` and
 `type`. Supported types are `string`, `integer`, `number`, `boolean`, `array`,
 `object`, and `null`. Supply each environment value as JSON. A string requires
 JSON quotation marks, while a header binding still takes the complete raw
@@ -237,19 +238,21 @@ that request. Use references in structured path segments, query values, and
 and boolean fixtures. JSON numbers used in URLs retain their original numeric
 spelling. The runner encodes each segment or query value once. Each structured
 path segment must be nonempty and cannot contain a slash, backslash, or ASCII
-control character. The segments `.` and `..` are also rejected. Literal path strings and literal query values keep their
-existing behavior. Binaries built before fixture support reject the new syntax.
+control character. The segments `.` and `..` are also rejected. Literal path
+strings and literal query values keep their existing behavior. Alpha.8 and
+earlier binaries reject the new fixture syntax.
 
 Each field assertion uses a JSON Pointer. `equals` compares the JSON value at
 that pointer to the fixture value. `equals_set` compares arrays as unordered
 sets of up to 256 scalars, with duplicates rejected in either array.
 Numeric values in expected fields, including nested values and set members,
-must be integer tokens from `-9223372036854775808` through
+must be exact integer tokens from `-9223372036854775808` through
 `18446744073709551615`. Preflight rejects out-of-range integers, fractions,
-and exponential notation in expectations to prevent rounded values from
-matching. For larger or decimal identifiers, compare JSON strings on both
-sides. Each request allows up to 32 assertions, with pointers limited to
-1,024 bytes and 32 segments. Field assertions apply alongside an optional `response_schema`.
+exponential notation, and `-0` in expectations. Use `0` for zero and JSON
+strings on both sides for larger or decimal identifiers. Each request allows up
+to 32 assertions, with pointers limited to 1,024 bytes and 32 segments. Field
+assertions apply alongside an optional `response_schema` and require a JSON
+response body.
 A missing or mismatched field fails with `response_field_mismatch`. Fixture
 values and environment-variable names stay out of runner reports and diagnostics.
 Paths and queries still go to the target and may appear in its access logs.
@@ -481,6 +484,9 @@ one GET or HEAD operation with one reusable actor credential snapshot. It
 uses the path, query, header, status, and response-schema rules above.
 Successful reads require a 2xx response that matches the optional exact
 status and response schema.
+From alpha.9, capacity plans can declare private values in `actor.fixtures`
+and apply `request.expect_fields` to a GET response. These assertions count
+toward the same trial pass criteria.
 
 Save this synthetic plan as `capacity.json` and use the localhost fixture
 at the top of this page.

@@ -64,6 +64,14 @@ must remain nonexecuting, and plans omitting queries must keep their existing
 behavior. The complete synthetic query example must be packaged and previewable.
 This alpha.6 addition retains workload version 1 and report schema version 2.
 
+Candidates containing private actor fixtures must exercise built and extracted
+binaries against a disposable loopback service. Verify preview without private
+environment values, correct per-actor path and query binding, and successful
+assertions with matching synthetic credentials. Reuse or swap a credential and
+verify that a measured HTTP 200 response fails its actor's field assertion while
+the schema-only control passes. Check report and diagnostic redaction of fixture
+bindings and values.
+
 For releases with `workload capacity`, run the extracted executable on each
 supported platform against the bounded two-slot loopback fixture. Verify the
 first failing and confirmed levels for sustained reads and for bursts, and
